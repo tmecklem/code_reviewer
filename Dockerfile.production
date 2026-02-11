@@ -1,0 +1,116 @@
+# syntax = docker/dockerfile:1
+
+# Build stage
+FROM debian:bookworm-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV MIX_ENV=prod
+ENV MIX_HOME=/opt/mix
+ENV HEX_HOME=/opt/hex
+
+# Install build dependencies
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y \
+    locales \
+    build-essential \
+    curl \
+    ca-certificates \
+    git \
+    autoconf \
+    libssl-dev \
+    libncurses5-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure UTF-8 locale
+RUN locale-gen en_US.UTF-8 && \
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Install asdf
+RUN git clone https://github.com/asdf-vm/asdf.git /root/.asdf --branch v0.14.1 && \
+    echo '. /root/.asdf/asdf.sh' >> /root/.bashrc
+
+# Install Erlang and Elixir via asdf
+WORKDIR /app
+COPY .tool-versions .
+RUN . /root/.asdf/asdf.sh && \
+    asdf plugin add erlang && \
+    asdf plugin add elixir && \
+    asdf install erlang && \
+    asdf install elixir
+
+# Install hex and rebar
+RUN . /root/.asdf/asdf.sh && \
+    mix local.hex --force && \
+    mix local.rebar --force
+
+# Copy dependency files
+COPY mix.exs mix.lock ./
+
+# Install dependencies
+RUN . /root/.asdf/asdf.sh && \
+    mix deps.get --only prod && \
+    mix deps.compile
+
+# Copy application code
+COPY lib ./lib
+COPY config ./config
+
+# Compile application
+RUN . /root/.asdf/asdf.sh && \
+    mix compile
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV MIX_ENV=prod
+
+# Install runtime dependencies
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y \
+    locales \
+    curl \
+    ca-certificates \
+    libssl3 \
+    libncurses6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install gh CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+    apt-get update && \
+    apt-get install -y gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Configure UTF-8 locale
+RUN locale-gen en_US.UTF-8 && \
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Copy asdf and installed runtimes from builder
+COPY --from=builder /root/.asdf /root/.asdf
+
+# Copy built application from builder
+WORKDIR /app
+COPY --from=builder /app/_build/prod ./\_build/prod
+COPY --from=builder /app/deps ./deps
+COPY --from=builder /app/mix.exs /app/mix.lock ./
+COPY --from=builder /app/lib ./lib
+COPY --from=builder /opt/mix /opt/mix
+COPY --from=builder /opt/hex /opt/hex
+
+# Set up asdf in runtime
+RUN echo '. /root/.asdf/asdf.sh' >> /root/.bashrc
+
+# Create entrypoint script
+RUN echo '#!/bin/bash' > /entrypoint.sh && \
+    echo '. /root/.asdf/asdf.sh' >> /entrypoint.sh && \
+    echo 'exec mix "$@"' >> /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["review", "--help"]

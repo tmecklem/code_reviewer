@@ -1,0 +1,33 @@
+# Git
+.git/
+.gitignore
+
+# Elixir build artifacts
+_build/
+deps/
+*.ez
+
+# Development files
+.devcontainer/
+bin/
+.vscode/
+
+# Test files
+test/
+.credo.exs
+.sobelow-conf
+
+# Documentation
+STATUS.md
+REVIEW_PREFERENCES.md
+pr_comments.json
+fetch_pr_comments.rb
+analyze_preferences.rb
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Environment files (should be passed at runtime)
+.env
+.env.*
