@@ -59,9 +59,21 @@ defmodule CodeReviewer.ClaudeCodeProvider do
   end
 
   defp clone_repo(repo, pr_info) do
-    temp_dir = Path.join(System.tmp_dir!(), "claude_review_#{:erlang.unique_integer([:positive])}")
+    # Use both unique integer and timestamp to avoid collisions
+    temp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "claude_review_#{:erlang.unique_integer([:positive])}_#{System.system_time(:millisecond)}"
+      )
+
     base_branch = Map.get(pr_info, "baseRefName", "main")
     head_branch = Map.get(pr_info, "headRefName", "HEAD")
+
+    # Clean up if directory exists from a previous failed run
+    if File.exists?(temp_dir) do
+      Logger.debug("Cleaning up existing temp dir: #{temp_dir}")
+      File.rm_rf(temp_dir)
+    end
 
     Logger.info("Cloning #{repo} to #{temp_dir}")
 
@@ -83,6 +95,7 @@ defmodule CodeReviewer.ClaudeCodeProvider do
         end
 
       {error, _} ->
+        cleanup_temp_repo(temp_dir)
         {:error, "Failed to clone repo: #{error}"}
     end
   end
