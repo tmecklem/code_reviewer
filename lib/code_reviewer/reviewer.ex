@@ -97,20 +97,25 @@ defmodule CodeReviewer.Reviewer do
   end
 
   defp review_with_rule_groups(rule_groups, diff, pr_info, repo) do
+    require Logger
     provider = get_llm_provider()
 
     rule_groups
     |> Enum.map(fn rule_group ->
       case provider.review_code(rule_group, diff, pr_info, repo) do
-        {:ok, result} -> Map.get(result, "findings", [])
-        {:error, _reason} -> []
+        {:ok, result} ->
+          Map.get(result, "findings", [])
+
+        {:error, reason} ->
+          Logger.error("Review failed for rule group '#{rule_group.name}': #{inspect(reason)}")
+          []
       end
     end)
     |> List.flatten()
   end
 
   defp get_llm_provider do
-    case System.get_env("LLM_PROVIDER") do
+    case Application.get_env(:code_reviewer, :llm_provider, "openai") do
       "claude_code" -> ClaudeCodeProvider
       _ -> LLMClient
     end

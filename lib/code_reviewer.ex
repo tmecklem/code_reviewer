@@ -1,18 +1,5 @@
 defmodule CodeReviewer do
   @moduledoc """
-  Documentation for `CodeReviewer`.
+  Code reviewer application that uses LLM providers to review GitHub pull requests.
   """
-
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> CodeReviewer.hello()
-      :world
-
-  """
-  def hello do
-    :world
-  end
 end

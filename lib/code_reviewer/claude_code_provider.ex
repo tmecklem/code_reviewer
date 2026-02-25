@@ -203,7 +203,7 @@ defmodule CodeReviewer.ClaudeCodeProvider do
   @doc false
   def find_claude_code do
     candidates = [
-      System.get_env("CLAUDE_CODE_PATH"),
+      Application.get_env(:code_reviewer, :claude_code_path),
       System.find_executable("claude"),
       System.find_executable("claude-code"),
       Path.expand("~/.local/bin/claude"),

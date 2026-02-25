@@ -112,7 +112,8 @@ defmodule CodeReviewer.LLMClient do
   defp build_pr_context(_), do: "No PR information available"
 
   defp call_openai(prompt) do
-    api_key = System.get_env("OPENAI_API_KEY")
+    openai_config = Application.get_env(:code_reviewer, :openai, [])
+    api_key = Keyword.get(openai_config, :api_key)
 
     if api_key do
       headers = [
@@ -122,7 +123,7 @@ defmodule CodeReviewer.LLMClient do
 
       body =
         Jason.encode!(%{
-          model: System.get_env("OPENAI_MODEL", "gpt-4o"),
+          model: Keyword.get(openai_config, :model, "gpt-4o"),
           messages: [
             %{
               role: "system",

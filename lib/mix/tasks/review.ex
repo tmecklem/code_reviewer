@@ -135,33 +135,30 @@ defmodule Mix.Tasks.Review do
   end
 
   defp post_review(repo, pr_number, formatted) do
-    Mix.shell().info("\n📤 Posting review to GitHub...")
+    Mix.shell().info("\n📤 Creating draft review on GitHub...")
 
-    # Post individual comments
-    comment_results =
-      Enum.map(formatted.comments, fn comment ->
-        GitHubClient.post_review_comment(
-          repo,
-          pr_number,
-          comment.file,
-          comment.line,
-          comment.body
-        )
-      end)
+    # Fetch the HEAD commit SHA for inline comments
+    case GitHubClient.fetch_pr_head_sha(repo, pr_number) do
+      {:ok, commit_sha} ->
+        # Create a pending review with all comments at once
+        case GitHubClient.create_pending_review(
+               repo,
+               pr_number,
+               commit_sha,
+               formatted.comments,
+               formatted.summary
+             ) do
+          {:ok, _} ->
+            Mix.shell().info("✅ Draft review created with #{length(formatted.comments)} comment(s)")
+            Mix.shell().info("👀 View and submit the review at: https://github.com/#{repo}/pull/#{pr_number}")
 
-    failed_comments = Enum.count(comment_results, fn result -> match?({:error, _}, result) end)
-
-    if failed_comments > 0 do
-      Mix.shell().error("⚠️  #{failed_comments} comment(s) failed to post")
-    end
-
-    # Submit the review with summary
-    case GitHubClient.submit_review(repo, pr_number, formatted.summary, "COMMENT") do
-      {:ok, _} ->
-        Mix.shell().info("✅ Review posted successfully!")
+          {:error, reason} ->
+            Mix.shell().error("❌ Failed to create draft review: #{reason}")
+        end
 
       {:error, reason} ->
-        Mix.shell().error("❌ Failed to submit review: #{reason}")
+        Mix.shell().error("❌ Failed to fetch PR commit SHA: #{reason}")
+        Mix.shell().error("Cannot post inline comments without commit SHA")
     end
   end
 end
