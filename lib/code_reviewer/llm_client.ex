@@ -11,7 +11,7 @@ defmodule CodeReviewer.LLMClient do
 
   Returns {:ok, response} with findings or {:error, reason}.
   """
-  def review_code(rule_group, diff_content, pr_info) do
+  def review_code(rule_group, diff_content, pr_info, _repo \\ nil) do
     with :ok <- validate_rule_group(rule_group),
          :ok <- validate_diff(diff_content),
          {:ok, prompt} <- build_prompt(rule_group, diff_content, pr_info),

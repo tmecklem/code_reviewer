@@ -35,23 +35,173 @@ defmodule CodeReviewer.ClaudeCodeProvider do
   """
 
   @doc """
-  Reviews code using Claude Code CLI.
+  Reviews code using Claude Code CLI by cloning the repo and running git diff.
 
   Returns {:ok, response} with findings or {:error, reason}.
   """
-  def review_code(rule_group, diff_content, pr_info) do
-    with {:ok, claude_path} <- find_claude_code(),
-         {:ok, prompt} <- build_review_prompt(rule_group, diff_content, pr_info),
-         {:ok, result} <- call_claude_code(claude_path, prompt) do
-      parse_response(result)
-    else
-      {:error, reason} = error ->
-        Logger.error("Claude Code review failed: #{inspect(reason)}")
-        error
+  def review_code(rule_group, _diff_content, pr_info, repo) do
+    temp_dir = nil
+
+    try do
+      with {:ok, claude_path} <- find_claude_code(),
+           {:ok, temp_dir} <- clone_repo(repo, pr_info),
+           {:ok, prompt} <- build_review_prompt(rule_group, pr_info),
+           {:ok, output} <- call_claude_code_in_repo(claude_path, prompt, temp_dir) do
+        parse_claude_response(output)
+      else
+        {:error, reason} = error ->
+          Logger.error("Claude Code review failed: #{inspect(reason)}")
+          error
+      end
+    after
+      cleanup_temp_repo(temp_dir)
     end
   end
 
-  defp find_claude_code do
+  defp clone_repo(repo, pr_info) do
+    temp_dir = Path.join(System.tmp_dir!(), "claude_review_#{:erlang.unique_integer([:positive])}")
+    base_branch = Map.get(pr_info, "baseRefName", "main")
+    head_branch = Map.get(pr_info, "headRefName", "HEAD")
+
+    Logger.info("Cloning #{repo} to #{temp_dir}")
+
+    # Clone the repo
+    case System.cmd("gh", ["repo", "clone", repo, temp_dir], stderr_to_stdout: true) do
+      {_, 0} ->
+        # Fetch the PR branches
+        case System.cmd("git", ["fetch", "origin", "#{head_branch}:#{head_branch}"],
+               cd: temp_dir,
+               stderr_to_stdout: true
+             ) do
+          {_, 0} ->
+            Logger.info("Fetched branch #{head_branch}, base is #{base_branch}")
+            {:ok, temp_dir}
+
+          {error, _} ->
+            cleanup_temp_repo(temp_dir)
+            {:error, "Failed to fetch PR branch: #{error}"}
+        end
+
+      {error, _} ->
+        {:error, "Failed to clone repo: #{error}"}
+    end
+  end
+
+  @doc false
+  def cleanup_temp_repo(nil), do: :ok
+
+  def cleanup_temp_repo(temp_dir) do
+    if File.exists?(temp_dir) do
+      Logger.debug("Cleaning up temp repo: #{temp_dir}")
+      File.rm_rf(temp_dir)
+    end
+  end
+
+  @doc false
+  def build_review_prompt(rule_group, pr_info) do
+    pr_context = build_pr_context(pr_info)
+    base_branch = Map.get(pr_info, "baseRefName", "main")
+    head_branch = Map.get(pr_info, "headRefName", "HEAD")
+
+    prompt = """
+    You are Tim's AI code reviewer. You think and review exactly like Tim does.
+
+    ## Review Focus: #{rule_group.name}
+    Priority: #{rule_group.priority}
+
+    ## Rules for this review:
+    #{Enum.map_join(rule_group.rules, "\n", fn rule -> "- #{rule}" end)}
+
+    ## Review Context:
+    #{rule_group.context}
+
+    ## Pull Request Information:
+    #{pr_context}
+
+    ## Your Task:
+    You are currently in a git repository with the PR code checked out.
+
+    1. Run `git diff #{base_branch}...#{head_branch}` to see the changes in this PR
+    2. Review the diff according to the rules above
+    3. Return your findings as JSON matching the schema provided
+
+    Important:
+    - Only flag actual issues you find
+    - Be specific with file paths and line numbers from the diff
+    - Quote the exact code when relevant
+    - Match Tim's tone: start positive if things look good, be directive about issues
+    - If no issues found, return empty findings array with positive summary
+    """
+
+    {:ok, prompt}
+  end
+
+  defp call_claude_code_in_repo(claude_path, prompt, repo_dir) do
+    Logger.info("Calling Claude Code in repository...")
+
+    # Write prompt to temp file
+    prompt_file =
+      Path.join(System.tmp_dir!(), "claude_prompt_#{:erlang.unique_integer([:positive])}.txt")
+
+    File.write!(prompt_file, prompt)
+
+    try do
+      bash_cmd =
+        "cd #{repo_dir} && cat #{prompt_file} | #{claude_path} --print --output-format json --json-schema '#{@json_schema}' --model claude-sonnet-4-6 --debug --dangerously-skip-permissions"
+
+      Logger.debug("Executing: #{bash_cmd}")
+
+      case System.cmd("bash", ["-c", bash_cmd], stderr_to_stdout: true) do
+        {output, 0} ->
+          # Check if the response indicates an error
+          case Jason.decode(output) do
+            {:ok, %{"type" => "result", "subtype" => "error_during_execution"} = result} ->
+              Logger.error("Claude Code error_during_execution: #{inspect(result)}")
+              {:error, "Claude Code encountered an error during execution: #{inspect(result)}"}
+
+            _ ->
+              {:ok, output}
+          end
+
+        {error_output, exit_code} ->
+          {:error, "Claude Code exited with code #{exit_code}: #{error_output}"}
+      end
+    after
+      File.rm(prompt_file)
+    end
+  end
+
+  @doc false
+  def parse_claude_response(output) do
+    case Jason.decode(output) do
+      {:ok, %{"structured_output" => structured_output} = response} ->
+        log_debug_metadata(response)
+        {:ok, structured_output}
+
+      {:ok, response} ->
+        log_debug_metadata(response)
+        {:ok, response}
+
+      {:error, error} ->
+        {:error, "Failed to parse Claude output: #{inspect(error)}"}
+    end
+  end
+
+  @doc false
+  def log_debug_metadata(%{
+        "duration_ms" => duration_ms,
+        "duration_api_ms" => duration_api_ms,
+        "num_turns" => num_turns
+      }) do
+    Logger.info(
+      "Claude Code execution: #{duration_ms}ms total, #{duration_api_ms}ms API, #{num_turns} turns"
+    )
+  end
+
+  def log_debug_metadata(_), do: :ok
+
+  @doc false
+  def find_claude_code do
     candidates = [
       System.get_env("CLAUDE_CODE_PATH"),
       System.find_executable("claude"),
@@ -70,98 +220,8 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     end
   end
 
-  defp call_claude_code(claude_path, prompt) do
-    Logger.info("Calling Claude Code for review...")
-
-    # Build command args
-    args = [
-      "--print",
-      prompt,
-      "--output-format",
-      "json",
-      "--json-schema",
-      @json_schema,
-      "--tools",
-      "",
-      # Disable tools for safety
-      "--dangerously-skip-permissions"
-      # Skip permissions since we're just analyzing text
-    ]
-
-    Logger.debug("Executing: #{claude_path} #{Enum.join(args, " ")}")
-
-    # Call Claude Code CLI
-    case System.cmd(claude_path, args, stderr_to_stdout: true) do
-      {output, 0} ->
-        Logger.debug("Claude Code output: #{String.slice(output, 0, 500)}...")
-        parse_claude_output(output)
-
-      {error_output, exit_code} ->
-        {:error, "Claude Code exited with code #{exit_code}: #{error_output}"}
-    end
-  end
-
-  defp parse_claude_output(output) do
-    case Jason.decode(output) do
-      {:ok, %{"result" => result}} when is_binary(result) ->
-        # Result is JSON string, decode it
-        case Jason.decode(result) do
-          {:ok, parsed} -> {:ok, parsed}
-          {:error, _} -> {:ok, %{"findings" => [], "summary" => result}}
-        end
-
-      {:ok, %{"result" => result}} when is_map(result) ->
-        # Result is already a map
-        {:ok, result}
-
-      {:ok, result} when is_map(result) ->
-        # Direct map result
-        {:ok, result}
-
-      {:error, error} ->
-        {:error, "Failed to parse Claude Code output: #{inspect(error)}"}
-    end
-  end
-
-  defp build_review_prompt(rule_group, diff_content, pr_info) do
-    pr_context = build_pr_context(pr_info)
-
-    prompt = """
-    You are Tim's AI code reviewer. You think and review exactly like Tim does.
-
-    ## Review Focus: #{rule_group.name}
-    Priority: #{rule_group.priority}
-
-    ## Rules for this review:
-    #{Enum.map_join(rule_group.rules, "\n", fn rule -> "- #{rule}" end)}
-
-    ## Review Context:
-    #{rule_group.context}
-
-    ## Pull Request Information:
-    #{pr_context}
-
-    ## Code Changes:
-    ```diff
-    #{diff_content}
-    ```
-
-    ## Your Task:
-    Review the code changes above according to the rules and context provided.
-    Return your findings as JSON matching the schema provided.
-
-    Important:
-    - Only flag actual issues you find
-    - Be specific with file paths and line numbers
-    - Quote the exact code when relevant
-    - Match Tim's tone: start positive if things look good, be directive about issues
-    - If no issues found, return empty findings array with positive summary
-    """
-
-    {:ok, prompt}
-  end
-
-  defp build_pr_context(pr_info) when is_map(pr_info) do
+  @doc false
+  def build_pr_context(pr_info) when is_map(pr_info) do
     """
     Title: #{Map.get(pr_info, "title", "N/A")}
     Author: #{get_in(pr_info, ["author", "login"]) || "N/A"}
@@ -173,11 +233,5 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     """
   end
 
-  defp build_pr_context(_), do: "No PR information available"
-
-  defp parse_response({:ok, parsed}) when is_map(parsed) do
-    {:ok, parsed}
-  end
-
-  defp parse_response({:error, _} = error), do: error
+  def build_pr_context(_), do: "No PR information available"
 end

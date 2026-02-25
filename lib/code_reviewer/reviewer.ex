@@ -85,7 +85,7 @@ defmodule CodeReviewer.Reviewer do
     with {:ok, pr_info} <- GitHubClient.fetch_pr_info(repo, pr_number),
          {:ok, diff} <- GitHubClient.fetch_pr_diff(repo, pr_number),
          {:ok, files} <- GitHubClient.fetch_pr_files(repo, pr_number) do
-      findings = review_with_rule_groups(rule_groups, diff, pr_info)
+      findings = review_with_rule_groups(rule_groups, diff, pr_info, repo)
 
       {:ok,
        %{
@@ -96,12 +96,12 @@ defmodule CodeReviewer.Reviewer do
     end
   end
 
-  defp review_with_rule_groups(rule_groups, diff, pr_info) do
+  defp review_with_rule_groups(rule_groups, diff, pr_info, repo) do
     provider = get_llm_provider()
 
     rule_groups
     |> Enum.map(fn rule_group ->
-      case provider.review_code(rule_group, diff, pr_info) do
+      case provider.review_code(rule_group, diff, pr_info, repo) do
         {:ok, result} -> Map.get(result, "findings", [])
         {:error, _reason} -> []
       end

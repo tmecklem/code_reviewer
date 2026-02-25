@@ -21,45 +21,40 @@ RUN apt-get update -qq && \
     autoconf \
     libssl-dev \
     libncurses5-dev \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure UTF-8 locale
-RUN locale-gen en_US.UTF-8 && \
-    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && \
+    locale-gen
 
-# Install asdf
-RUN git clone https://github.com/asdf-vm/asdf.git /root/.asdf --branch v0.14.1 && \
-    echo '. /root/.asdf/asdf.sh' >> /root/.bashrc
+# Install mise
+RUN curl https://mise.run | sh && \
+    echo 'eval "$(~/.local/bin/mise activate bash)"' >> /root/.bashrc
+ENV PATH="/root/.local/bin:${PATH}"
 
-# Install Erlang and Elixir via asdf
+# Install Erlang and Elixir via mise
 WORKDIR /app
 COPY .tool-versions .
-RUN . /root/.asdf/asdf.sh && \
-    asdf plugin add erlang && \
-    asdf plugin add elixir && \
-    asdf install erlang && \
-    asdf install elixir
+RUN mise install && \
+    mise reshim
 
 # Install hex and rebar
-RUN . /root/.asdf/asdf.sh && \
-    mix local.hex --force && \
-    mix local.rebar --force
+RUN mise exec -- mix local.hex --force && \
+    mise exec -- mix local.rebar --force
 
 # Copy dependency files
 COPY mix.exs mix.lock ./
 
 # Install dependencies
-RUN . /root/.asdf/asdf.sh && \
-    mix deps.get --only prod && \
-    mix deps.compile
+RUN mise exec -- mix deps.get --only prod && \
+    mise exec -- mix deps.compile
 
 # Copy application code
 COPY lib ./lib
-COPY config ./config
 
 # Compile application
-RUN . /root/.asdf/asdf.sh && \
-    mix compile
+RUN mise exec -- mix compile
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -68,6 +63,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 ENV MIX_ENV=prod
+ENV LLM_PROVIDER=claude_code
+ENV ASDF_DIR=/root/.asdf
 
 # Install runtime dependencies
 RUN apt-get update -qq && \
@@ -77,7 +74,16 @@ RUN apt-get update -qq && \
     ca-certificates \
     libssl3 \
     libncurses6 \
+    git \
+    bash \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Add Claude to PATH
+ENV PATH="/root/.local/bin:${PATH}"
 
 # Install gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
@@ -88,14 +94,37 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     rm -rf /var/lib/apt/lists/*
 
 # Configure UTF-8 locale
-RUN locale-gen en_US.UTF-8 && \
-    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && \
+    locale-gen
 
-# Copy asdf and installed runtimes from builder
-COPY --from=builder /root/.asdf /root/.asdf
+# Create non-root user
+RUN useradd -m -s /bin/bash -u 1000 appuser && \
+    echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser && \
+    chmod 0440 /etc/sudoers.d/appuser
+
+# Set up environment for appuser
+ENV HOME=/home/appuser
+
+# Copy mise binary and installed runtimes from builder to appuser's home
+COPY --from=builder --chown=appuser:appuser /root/.local/bin/mise /home/appuser/.local/bin/mise
+COPY --from=builder --chown=appuser:appuser /root/.local/share/mise /home/appuser/.local/share/mise
+
+# Install Claude Code CLI as appuser
+USER appuser
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Set up mise activation
+RUN echo 'eval "$(~/.local/bin/mise activate bash)"' >> /home/appuser/.bashrc
+
+# Add to PATH
+ENV PATH="/home/appuser/.local/bin:${PATH}"
+
+# Switch back to root for copying application files
+USER root
 
 # Copy built application from builder
 WORKDIR /app
+COPY --from=builder /app/.tool-versions ./
 COPY --from=builder /app/_build/prod ./\_build/prod
 COPY --from=builder /app/deps ./deps
 COPY --from=builder /app/mix.exs /app/mix.lock ./
@@ -103,14 +132,61 @@ COPY --from=builder /app/lib ./lib
 COPY --from=builder /opt/mix /opt/mix
 COPY --from=builder /opt/hex /opt/hex
 
-# Set up asdf in runtime
-RUN echo '. /root/.asdf/asdf.sh' >> /root/.bashrc
+# Set ownership of /app to appuser
+RUN chown -R appuser:appuser /app
+
+# Switch to appuser
+USER appuser
+
+# Install hex and rebar in runtime
+RUN mise exec -- mix local.hex --force && \
+    mise exec -- mix local.rebar --force
+
+# Switch back to root to create entrypoint script
+USER root
 
 # Create entrypoint script
-RUN echo '#!/bin/bash' > /entrypoint.sh && \
-    echo '. /root/.asdf/asdf.sh' >> /entrypoint.sh && \
-    echo 'exec mix "$@"' >> /entrypoint.sh && \
-    chmod +x /entrypoint.sh
+RUN cat > /entrypoint.sh <<'EOF'
+#!/bin/bash
+set -e
+
+# Validate required environment variables
+if [ -z "$GITHUB_TOKEN" ]; then
+  echo "ERROR: GITHUB_TOKEN environment variable is required"
+  exit 1
+fi
+
+# Check if Claude Code authentication is available
+# Either via mounted config or ANTHROPIC_API_KEY
+if [ "${LLM_PROVIDER:-claude_code}" = "claude_code" ]; then
+  if [ ! -d "/home/appuser/.claude" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "ERROR: Claude Code requires either:"
+    echo "  1. Mounted authentication: -v ~/.claude:/home/appuser/.claude"
+    echo "  2. API key: -e ANTHROPIC_API_KEY=sk-ant-..."
+    exit 1
+  fi
+fi
+
+# Authenticate gh CLI (ignore exit code 1 which is just a warning about env var usage)
+echo "$GITHUB_TOKEN" | gh auth login --with-token || true
+
+# Export ANTHROPIC_API_KEY if provided (for non-mounted auth)
+if [ -n "$ANTHROPIC_API_KEY" ]; then
+  export ANTHROPIC_API_KEY
+fi
+
+# Set production environment
+export MIX_ENV=prod
+
+# Execute the review command with mise
+cd /app
+exec /home/appuser/.local/bin/mise exec -- mix "$@"
+EOF
+
+RUN chmod +x /entrypoint.sh
+
+# Switch back to appuser for runtime
+USER appuser
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["review", "--help"]

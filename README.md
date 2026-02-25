@@ -39,22 +39,73 @@ mix precommit
 
 ### Docker Deployment
 
-Build the production image:
+#### Quick Start (Recommended)
+
+Use the one-shot Docker script that handles everything:
 
 ```bash
-docker build -f Dockerfile.production -t code-reviewer:latest .
+# Set your environment variables
+export GITHUB_TOKEN="ghp_..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# Review a PR (auto-builds Docker image on first run)
+bin/docker-review owner/repo 123
+
+# Review with PR URL
+bin/docker-review https://github.com/owner/repo/pull/123
+
+# Review with specific rule groups
+bin/docker-review owner/repo 123 --groups quality,testing
+
+# Post review comments to GitHub
+bin/docker-review owner/repo 123 --post
+
+# Force rebuild of Docker image
+bin/docker-review owner/repo 123 --rebuild
 ```
 
-Run a review:
+The script automatically:
+- Builds the Docker image on first run (or with `--rebuild`)
+- Passes through your `GITHUB_TOKEN` and API keys
+- Detects your LLM provider (Claude Code by default)
+- Parses PR URLs or repo/number arguments
+- Runs the review in a secure container
+
+#### Using OpenAI Instead
 
 ```bash
+export GITHUB_TOKEN="ghp_..."
+export OPENAI_API_KEY="sk-..."
+export LLM_PROVIDER="openai"
+
+bin/docker-review owner/repo 123
+```
+
+#### Manual Docker Commands
+
+If you prefer manual control:
+
+```bash
+# Build the production image
+docker build -f Dockerfile.production -t code-reviewer:latest .
+
+# Run a review with Claude Code
+docker run --rm \
+  -e GITHUB_TOKEN="your-github-token" \
+  -e ANTHROPIC_API_KEY="your-anthropic-key" \
+  code-reviewer:latest \
+  review owner/repo 123
+
+# Run with OpenAI
 docker run --rm \
   -e GITHUB_TOKEN="your-github-token" \
   -e OPENAI_API_KEY="your-openai-key" \
-  -e OPENAI_MODEL="gpt-4o" \
+  -e LLM_PROVIDER="openai" \
   code-reviewer:latest \
   review owner/repo 123
 ```
+
+**Security Note:** The production Docker image sandboxes the `--dangerously-skip-permissions` flag within the container, providing isolation for Claude Code's MCP server tool execution.
 
 ## Usage
 

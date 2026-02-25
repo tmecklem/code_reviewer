@@ -1,0 +1,202 @@
+#!/bin/bash
+set -e
+
+# CodeReviewer Docker One-Shot Script
+# Usage:
+#   bin/docker-review owner/repo 123
+#   bin/docker-review https://github.com/owner/repo/pull/123
+#   bin/docker-review owner/repo 123 --groups quality,testing
+#   bin/docker-review owner/repo 123 --post
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+usage() {
+    echo "Usage: $0 <repo|pr-url> [pr-number] [options]"
+    echo ""
+    echo "Arguments:"
+    echo "  repo          Repository in owner/repo format"
+    echo "  pr-number     Pull request number"
+    echo "  pr-url        Full GitHub PR URL (e.g., https://github.com/owner/repo/pull/123)"
+    echo ""
+    echo "Options:"
+    echo "  --groups      Comma-separated list of rule groups (blocking,testing,quality,etc.)"
+    echo "  --post        Post review comments to GitHub"
+    echo "  --rebuild     Force rebuild of Docker image"
+    echo "  --help        Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0 tmecklem/code_reviewer 123"
+    echo "  $0 https://github.com/tmecklem/code_reviewer/pull/123"
+    echo "  $0 tmecklem/code_reviewer 123 --groups quality,testing"
+    echo "  $0 tmecklem/code_reviewer 123 --post"
+    echo ""
+    echo "Environment Variables:"
+    echo "  GITHUB_TOKEN           Required for GitHub access"
+    echo "  LLM_PROVIDER           'claude_code' (default) or 'openai'"
+    echo "  ANTHROPIC_API_KEY      Required for Claude Code (default provider)"
+    echo "  OPENAI_API_KEY         Required if using OpenAI"
+    echo "  OPENAI_MODEL           Optional, defaults to gpt-4o"
+    exit 1
+}
+
+# Parse arguments
+REPO=""
+PR_NUMBER=""
+MIX_ARGS=()
+REBUILD=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --help|-h)
+            usage
+            ;;
+        --rebuild)
+            REBUILD=true
+            shift
+            ;;
+        --groups|--post)
+            MIX_ARGS+=("$1")
+            if [[ $1 == "--groups" ]]; then
+                shift
+                MIX_ARGS+=("$1")
+            fi
+            shift
+            ;;
+        *)
+            if [[ -z "$REPO" ]]; then
+                # First argument - could be repo or PR URL
+                if [[ $1 =~ ^https://github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+                    REPO="${BASH_REMATCH[1]}"
+                    PR_NUMBER="${BASH_REMATCH[2]}"
+                else
+                    REPO="$1"
+                fi
+            elif [[ -z "$PR_NUMBER" ]]; then
+                PR_NUMBER="$1"
+            else
+                echo -e "${RED}Error: Unexpected argument: $1${NC}"
+                usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate arguments
+if [[ -z "$REPO" ]] || [[ -z "$PR_NUMBER" ]]; then
+    echo -e "${RED}Error: Missing required arguments${NC}\n"
+    usage
+fi
+
+# Validate environment variables
+if [[ -z "$GITHUB_TOKEN" ]]; then
+    echo -e "${RED}Error: GITHUB_TOKEN environment variable is required${NC}"
+    echo "Set it with: export GITHUB_TOKEN='ghp_...'"
+    exit 1
+fi
+
+# Determine LLM provider and validate API keys
+LLM_PROVIDER="${LLM_PROVIDER:-claude_code}"
+
+if [[ "$LLM_PROVIDER" == "claude_code" ]]; then
+    if [[ -n "$ANTHROPIC_API_KEY" ]]; then
+        # Using API key authentication
+        PROVIDER_ENV="-e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+        PROVIDER_NAME="Claude Code (API Key)"
+    else
+        # Will attempt to use mounted authenticated session
+        PROVIDER_ENV=""
+        PROVIDER_NAME="Claude Code (Authenticated Session)"
+    fi
+elif [[ "$LLM_PROVIDER" == "openai" ]]; then
+    if [[ -z "$OPENAI_API_KEY" ]]; then
+        echo -e "${RED}Error: OPENAI_API_KEY environment variable is required for OpenAI${NC}"
+        echo "Set it with: export OPENAI_API_KEY='sk-...'"
+        exit 1
+    fi
+    PROVIDER_ENV="-e OPENAI_API_KEY=$OPENAI_API_KEY -e LLM_PROVIDER=openai"
+    if [[ -n "$OPENAI_MODEL" ]]; then
+        PROVIDER_ENV="$PROVIDER_ENV -e OPENAI_MODEL=$OPENAI_MODEL"
+    fi
+    PROVIDER_NAME="OpenAI"
+else
+    echo -e "${RED}Error: Invalid LLM_PROVIDER: $LLM_PROVIDER${NC}"
+    echo "Must be 'claude_code' or 'openai'"
+    exit 1
+fi
+
+# Print configuration
+echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  CodeReviewer Docker One-Shot Review  ║${NC}"
+echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${GREEN}Repository:${NC}    $REPO"
+echo -e "${GREEN}PR Number:${NC}     $PR_NUMBER"
+echo -e "${GREEN}LLM Provider:${NC}  $PROVIDER_NAME"
+if [[ ${#MIX_ARGS[@]} -gt 0 ]]; then
+    echo -e "${GREEN}Options:${NC}       ${MIX_ARGS[*]}"
+fi
+echo ""
+
+# Build Docker image if needed
+IMAGE_NAME="code-reviewer:latest"
+
+if [[ "$REBUILD" == true ]] || ! docker image inspect "$IMAGE_NAME" &> /dev/null; then
+    echo -e "${YELLOW}Building Docker image...${NC}"
+    cd "$PROJECT_ROOT"
+    docker build -f Dockerfile.production -t "$IMAGE_NAME" .
+    echo -e "${GREEN}✓ Docker image built successfully${NC}"
+    echo ""
+else
+    echo -e "${GREEN}✓ Using existing Docker image${NC}"
+    echo ""
+fi
+
+# Run the review
+echo -e "${YELLOW}Starting review...${NC}"
+echo ""
+
+# Check if we should mount Claude Code config for authenticated session
+VOLUME_MOUNTS=""
+if [[ "$LLM_PROVIDER" == "claude_code" ]] && [[ -z "$ANTHROPIC_API_KEY" ]]; then
+    # Use locally authenticated Claude Code session
+    CLAUDE_CONFIG_DIR="${HOME}/.claude"
+    if [[ -d "$CLAUDE_CONFIG_DIR" ]]; then
+        echo -e "${GREEN}✓ Using authenticated Claude Code session from host${NC}"
+        VOLUME_MOUNTS="-v ${CLAUDE_CONFIG_DIR}:/home/appuser/.claude"
+        PROVIDER_ENV=""  # Don't need API key if using mounted session
+    else
+        echo -e "${RED}Error: Claude Code not authenticated and no ANTHROPIC_API_KEY provided${NC}"
+        echo "Either:"
+        echo "  1. Authenticate Claude Code: claude login"
+        echo "  2. Set ANTHROPIC_API_KEY: export ANTHROPIC_API_KEY='sk-ant-...'"
+        exit 1
+    fi
+fi
+
+docker run --rm \
+    -e GITHUB_TOKEN="$GITHUB_TOKEN" \
+    -e LLM_PROVIDER="$LLM_PROVIDER" \
+    $VOLUME_MOUNTS \
+    $PROVIDER_ENV \
+    "$IMAGE_NAME" \
+    review "$REPO" "$PR_NUMBER" "${MIX_ARGS[@]}"
+
+EXIT_CODE=$?
+
+echo ""
+if [[ $EXIT_CODE -eq 0 ]]; then
+    echo -e "${GREEN}✓ Review completed successfully${NC}"
+else
+    echo -e "${RED}✗ Review failed with exit code $EXIT_CODE${NC}"
+fi
+
+exit $EXIT_CODE
