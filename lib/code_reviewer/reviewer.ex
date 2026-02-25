@@ -100,18 +100,68 @@ defmodule CodeReviewer.Reviewer do
     require Logger
     provider = get_llm_provider()
 
-    rule_groups
-    |> Enum.map(fn rule_group ->
-      case provider.review_code(rule_group, diff, pr_info, repo) do
-        {:ok, result} ->
-          Map.get(result, "findings", [])
+    # For ClaudeCodeProvider, clone once and run reviews in parallel
+    if provider == ClaudeCodeProvider do
+      review_with_claude_code(rule_groups, diff, pr_info, repo, provider)
+    else
+      # For other providers, run sequentially without cloning
+      rule_groups
+      |> Enum.map(fn rule_group ->
+        case provider.review_code(rule_group, diff, pr_info, repo) do
+          {:ok, result} ->
+            Map.get(result, "findings", [])
 
-        {:error, reason} ->
-          Logger.error("Review failed for rule group '#{rule_group.name}': #{inspect(reason)}")
-          []
-      end
-    end)
-    |> List.flatten()
+          {:error, reason} ->
+            Logger.error("Review failed for rule group '#{rule_group.name}': #{inspect(reason)}")
+            []
+        end
+      end)
+      |> List.flatten()
+    end
+  end
+
+  defp review_with_claude_code(rule_groups, diff, pr_info, repo, provider) do
+    require Logger
+
+    # Clone the repo once
+    case provider.clone_repo(repo, pr_info) do
+      {:ok, temp_dir} ->
+        try do
+          Logger.info("Running #{length(rule_groups)} reviews in parallel")
+
+          # Run reviews in parallel
+          rule_groups
+          |> Task.async_stream(
+            fn rule_group ->
+              case provider.review_code(rule_group, diff, pr_info, repo, temp_dir) do
+                {:ok, result} ->
+                  Map.get(result, "findings", [])
+
+                {:error, reason} ->
+                  Logger.error(
+                    "Review failed for rule group '#{rule_group.name}': #{inspect(reason)}"
+                  )
+
+                  []
+              end
+            end,
+            timeout: :infinity,
+            max_concurrency: System.schedulers_online()
+          )
+          |> Enum.flat_map(fn
+            {:ok, findings} -> findings
+            {:exit, reason} ->
+              Logger.error("Review task crashed: #{inspect(reason)}")
+              []
+          end)
+        after
+          provider.cleanup_temp_repo(temp_dir)
+        end
+
+      {:error, reason} ->
+        Logger.error("Failed to clone repo: #{inspect(reason)}")
+        []
+    end
   end
 
   defp get_llm_provider do

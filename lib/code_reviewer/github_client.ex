@@ -72,10 +72,13 @@ defmodule CodeReviewer.GitHubClient do
 
   This creates a DRAFT review that you can view and submit later.
   All comments are added together in one pending review.
+
+  If a pending review already exists, it will be deleted first.
   """
   def create_pending_review(repo, pr_number, commit_sha, comments, body \\ "") do
     with :ok <- validate_repo_format(repo),
-         :ok <- validate_required_field(commit_sha, "commit_sha") do
+         :ok <- validate_required_field(commit_sha, "commit_sha"),
+         :ok <- delete_existing_pending_reviews(repo, pr_number) do
       api_path = "repos/#{repo}/pulls/#{pr_number}/reviews"
 
       # Create pending review with comments
@@ -100,6 +103,59 @@ defmodule CodeReviewer.GitHubClient do
         {output, 0} -> {:ok, output}
         {error, code} -> {:error, "Failed to create pending review (exit #{code}): #{error}"}
       end
+    end
+  end
+
+  @doc """
+  Lists all reviews for a PR and returns pending reviews.
+  """
+  def list_pending_reviews(repo, pr_number) do
+    with :ok <- validate_repo_format(repo),
+         {:ok, json} <- run_gh(["api", "repos/#{repo}/pulls/#{pr_number}/reviews"]) do
+      case Jason.decode(json) do
+        {:ok, reviews} when is_list(reviews) ->
+          pending = Enum.filter(reviews, fn review -> review["state"] == "PENDING" end)
+          {:ok, pending}
+
+        {:error, _} ->
+          {:error, "Failed to parse reviews JSON"}
+      end
+    end
+  end
+
+  @doc """
+  Deletes a review by ID.
+  """
+  def delete_review(repo, pr_number, review_id) do
+    with :ok <- validate_repo_format(repo) do
+      case run_gh(["api", "-X", "DELETE", "repos/#{repo}/pulls/#{pr_number}/reviews/#{review_id}"]) do
+        {:ok, _} -> :ok
+        error -> error
+      end
+    end
+  end
+
+  defp delete_existing_pending_reviews(repo, pr_number) do
+    case list_pending_reviews(repo, pr_number) do
+      {:ok, []} ->
+        :ok
+
+      {:ok, pending_reviews} ->
+        require Logger
+        Logger.info("Found #{length(pending_reviews)} pending review(s), deleting them first")
+
+        Enum.each(pending_reviews, fn review ->
+          case delete_review(repo, pr_number, review["id"]) do
+            :ok -> Logger.debug("Deleted pending review #{review["id"]}")
+            {:error, reason} -> Logger.warning("Failed to delete review #{review["id"]}: #{reason}")
+          end
+        end)
+
+        :ok
+
+      {:error, _reason} ->
+        # If we can't list reviews, just try to create anyway
+        :ok
     end
   end
 

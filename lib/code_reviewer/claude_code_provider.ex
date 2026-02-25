@@ -2,11 +2,16 @@ defmodule CodeReviewer.ClaudeCodeProvider do
   @moduledoc """
   Provider for using Claude Code CLI for code reviews.
 
-  This module uses Claude Code's --print mode to perform code reviews,
-  providing an alternative to direct OpenAI API integration.
+  Supports two modes:
+  - ACP mode: Uses Agent Client Protocol for streaming visibility (default)
+  - Print mode: Uses --print flag for one-shot execution (fallback)
+
+  Set CLAUDE_CODE_MODE=print to use print mode instead of ACP.
   """
 
   require Logger
+
+  alias CodeReviewer.ACPClient
 
   @json_schema """
   {
@@ -35,7 +40,25 @@ defmodule CodeReviewer.ClaudeCodeProvider do
   """
 
   @doc """
+  Reviews code using Claude Code CLI in a pre-cloned repository.
+
+  Returns {:ok, response} with findings or {:error, reason}.
+  """
+  def review_code(rule_group, _diff_content, pr_info, _repo, temp_dir) when is_binary(temp_dir) do
+    with {:ok, claude_path} <- find_claude_code(),
+         {:ok, prompt} <- build_review_prompt(rule_group, pr_info),
+         {:ok, output} <- call_claude_code_in_repo(claude_path, prompt, temp_dir) do
+      parse_claude_response(output)
+    else
+      {:error, reason} = error ->
+        Logger.error("Claude Code review failed: #{inspect(reason)}")
+        error
+    end
+  end
+
+  @doc """
   Reviews code using Claude Code CLI by cloning the repo and running git diff.
+  This version clones the repo for each call - prefer using the version with a pre-cloned temp_dir.
 
   Returns {:ok, response} with findings or {:error, reason}.
   """
@@ -44,7 +67,7 @@ defmodule CodeReviewer.ClaudeCodeProvider do
 
     try do
       with {:ok, claude_path} <- find_claude_code(),
-           {:ok, temp_dir} <- clone_repo(repo, pr_info),
+           {:ok, temp_dir} <- clone_repo_internal(repo, pr_info),
            {:ok, prompt} <- build_review_prompt(rule_group, pr_info),
            {:ok, output} <- call_claude_code_in_repo(claude_path, prompt, temp_dir) do
         parse_claude_response(output)
@@ -58,7 +81,15 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     end
   end
 
-  defp clone_repo(repo, pr_info) do
+  @doc """
+  Clones a repository and prepares it for review.
+  Returns {:ok, temp_dir} on success.
+  """
+  def clone_repo(repo, pr_info) do
+    clone_repo_internal(repo, pr_info)
+  end
+
+  defp clone_repo_internal(repo, pr_info) do
     # Use both unique integer and timestamp to avoid collisions
     temp_dir =
       Path.join(
@@ -149,14 +180,58 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     {:ok, prompt}
   end
 
-  defp call_claude_code_in_repo(claude_path, prompt, repo_dir) do
-    Logger.info("Calling Claude Code in repository...")
+  defp call_claude_code_in_repo(_claude_path, prompt, repo_dir) do
+    mode = Application.get_env(:code_reviewer, :claude_code_mode, "acp")
+
+    case mode do
+      "acp" -> call_with_acp(prompt, repo_dir)
+      "print" -> call_with_print(prompt, repo_dir)
+      _ -> call_with_acp(prompt, repo_dir)
+    end
+  end
+
+  defp call_with_acp(prompt, repo_dir) do
+    Logger.info("Using ACP mode for Claude Code (streaming enabled)")
+
+    # Add JSON schema instruction to the prompt
+    enhanced_prompt = """
+    #{prompt}
+
+    ## Output Format
+
+    You MUST respond with valid JSON matching this exact schema:
+
+    ```json
+    #{@json_schema}
+    ```
+
+    Return ONLY the JSON object, no markdown code fences, no explanations before or after.
+    """
+
+    case ACPClient.run_session(enhanced_prompt,
+           working_dir: repo_dir,
+           env: [{"ANTHROPIC_API_KEY", get_anthropic_api_key()}]
+         ) do
+      {:ok, result} ->
+        # The result should contain the final response
+        extract_json_from_acp_result(result)
+
+      error ->
+        error
+    end
+  end
+
+  defp call_with_print(prompt, repo_dir) do
+    Logger.info("Using print mode for Claude Code (no streaming)")
 
     # Write prompt to temp file
     prompt_file =
       Path.join(System.tmp_dir!(), "claude_prompt_#{:erlang.unique_integer([:positive])}.txt")
 
     File.write!(prompt_file, prompt)
+
+    # Find claude binary
+    {:ok, claude_path} = find_claude_code()
 
     try do
       bash_cmd =
@@ -181,6 +256,60 @@ defmodule CodeReviewer.ClaudeCodeProvider do
       end
     after
       File.rm(prompt_file)
+    end
+  end
+
+  defp get_anthropic_api_key do
+    case System.get_env("ANTHROPIC_API_KEY") do
+      nil ->
+        Logger.warning("ANTHROPIC_API_KEY not set, ACP mode may fail")
+        ""
+
+      key ->
+        key
+    end
+  end
+
+  defp extract_json_from_acp_result(result) do
+    # The result from ACP session contains the final response
+    # We need to extract the JSON from it
+    Logger.debug("ACP result: #{inspect(result)}")
+
+    case result do
+      # If it's already a map with the expected structure
+      %{"findings" => _, "summary" => _} = json_result ->
+        {:ok, Jason.encode!(json_result)}
+
+      # If it's a string response, try to parse it
+      response when is_binary(response) ->
+        # Try to extract JSON from markdown code fences or plain text
+        json_str =
+          response
+          |> String.replace(~r/```json\s*/, "")
+          |> String.replace(~r/```\s*$/, "")
+          |> String.trim()
+
+        case Jason.decode(json_str) do
+          {:ok, parsed} ->
+            {:ok, Jason.encode!(parsed)}
+
+          {:error, _} ->
+            # If parsing failed, try to find JSON in the text
+            case Regex.run(~r/(\{[\s\S]*"findings"[\s\S]*\})/, response, capture: :first) do
+              [json_match] ->
+                case Jason.decode(json_match) do
+                  {:ok, parsed} -> {:ok, Jason.encode!(parsed)}
+                  error -> {:error, "Failed to parse extracted JSON: #{inspect(error)}"}
+                end
+
+              nil ->
+                {:error, "Could not find JSON in ACP response: #{response}"}
+            end
+        end
+
+      # If it's some other structure, try to extract content
+      other ->
+        {:error, "Unexpected ACP result structure: #{inspect(other)}"}
     end
   end
 
