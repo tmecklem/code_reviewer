@@ -9,12 +9,15 @@ AI-powered code reviewer that thinks and reviews like Tim. Built with Elixir, us
 - Creates summary notes highlighting areas of concern and praise
 - Supports selective rule group application
 - Can post reviews directly to GitHub or output for manual review
+- **Agent Client Protocol (ACP) integration** - Can use Claude Code as LLM provider via ACP
 
 ## Prerequisites
 
 - Elixir 1.18+ and Erlang 27+
 - GitHub CLI (`gh`) authenticated with your account
-- OpenAI API key
+- **Either**:
+  - OpenAI API key (default)
+  - Claude Code CLI (for ACP integration)
 
 ## Installation
 
@@ -55,7 +58,25 @@ docker run --rm \
 
 ## Usage
 
-### Command Line
+### Using OpenAI (Default)
+
+```bash
+export GITHUB_TOKEN="your-token"
+export OPENAI_API_KEY="your-key"
+mix review owner/repo 123
+```
+
+### Using Claude Code (via ACP)
+
+```bash
+export GITHUB_TOKEN="your-token"
+export LLM_PROVIDER="claude_code"
+mix review owner/repo 123
+```
+
+See [ACP_INTEGRATION.md](ACP_INTEGRATION.md) for detailed Claude Code setup.
+
+### Command Options
 
 Review a PR and display results:
 
@@ -88,12 +109,18 @@ Available rule groups:
 
 ### Environment Variables
 
-Required:
+**Required:**
 - `GITHUB_TOKEN` - GitHub personal access token (for gh CLI)
-- `OPENAI_API_KEY` - OpenAI API key
 
-Optional:
-- `OPENAI_MODEL` - OpenAI model to use (default: "gpt-4o")
+**LLM Provider (choose one):**
+
+*Option 1: OpenAI (default)*
+- `OPENAI_API_KEY` - OpenAI API key
+- `OPENAI_MODEL` - (Optional) Model to use (default: "gpt-4o")
+
+*Option 2: Claude Code*
+- `LLM_PROVIDER="claude_code"` - Enable Claude Code via ACP
+- `CLAUDE_CODE_PATH` - (Optional) Path to Claude Code CLI if not in PATH
 
 ## Architecture
 
@@ -102,6 +129,7 @@ Optional:
 - **LLMClient** - OpenAI API integration for code review
 - **Reviewer** - Main orchestrator coordinating the review workflow
 - **OutputFormatter** - Formats findings into GitHub-ready comments and summaries
+- **ACPAgent** - Agent Client Protocol server for editor integration
 
 ## Development
 

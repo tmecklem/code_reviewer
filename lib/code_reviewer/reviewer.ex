@@ -4,7 +4,7 @@ defmodule CodeReviewer.Reviewer do
   Coordinates GitHub client, LLM client, and rule groups to perform reviews.
   """
 
-  alias CodeReviewer.{GitHubClient, LLMClient, OutputFormatter, RuleGroups}
+  alias CodeReviewer.{ClaudeCodeProvider, GitHubClient, LLMClient, OutputFormatter, RuleGroups}
 
   @doc """
   Reviews a PR using all default rule groups.
@@ -97,13 +97,22 @@ defmodule CodeReviewer.Reviewer do
   end
 
   defp review_with_rule_groups(rule_groups, diff, pr_info) do
+    provider = get_llm_provider()
+
     rule_groups
     |> Enum.map(fn rule_group ->
-      case LLMClient.review_code(rule_group, diff, pr_info) do
+      case provider.review_code(rule_group, diff, pr_info) do
         {:ok, result} -> Map.get(result, "findings", [])
         {:error, _reason} -> []
       end
     end)
     |> List.flatten()
+  end
+
+  defp get_llm_provider do
+    case System.get_env("LLM_PROVIDER") do
+      "claude_code" -> ClaudeCodeProvider
+      _ -> LLMClient
+    end
   end
 end
