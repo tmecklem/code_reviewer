@@ -1,10 +1,10 @@
-# Agent Client Protocol (ACP) Integration
+# Claude Code Integration
 
-CodeReviewer uses the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) to call Claude Code for AI-powered code reviews, providing an alternative to direct OpenAI API integration.
+CodeReviewer can use the Claude Code CLI's `--print` mode for AI-powered code reviews, providing an alternative to direct OpenAI API integration.
 
-## What is ACP?
+## How It Works
 
-The Agent Client Protocol is a standardized JSON-RPC 2.0 based protocol for communication between code editors and AI coding agents. CodeReviewer acts as an ACP **client**, spawning Claude Code and sending it review requests via stdio.
+CodeReviewer calls the `claude` CLI with the `--print` flag for non-interactive, programmatic code reviews. This uses Claude Code's built-in support for automation and scripting, with structured JSON output via `--output-format json` and `--json-schema` for validated responses.
 
 ## Quick Start
 
@@ -44,23 +44,23 @@ mix review owner/repo 123 --post
 ```
 
 CodeReviewer will:
-1. Spawn Claude Code via ACP
-2. Send review prompts for each rule group
-3. Receive structured findings
+1. Call `claude --print` with your review prompt
+2. Use `--json-schema` to enforce structured output
+3. Parse the JSON response with findings
 4. Format and display/post results
 
 ## How It Works
 
 When you set `LLM_PROVIDER=claude_code`, CodeReviewer:
 
-1. **Spawns Claude Code** - Uses ACP to start the Claude Code CLI process
-2. **Initializes Session** - Establishes protocol handshake and creates a conversation session
-3. **Sends Review Prompts** - For each rule group, sends a focused review prompt with:
+1. **Finds Claude CLI** - Locates `claude` command in PATH or `CLAUDE_CODE_PATH`
+2. **Builds Review Prompt** - For each rule group, creates a focused prompt with:
    - Rule group context and rules
    - PR information (title, author, description)
    - Diff content
-   - Response format specification (JSON)
-4. **Receives Responses** - Claude Code returns structured findings
+   - JSON schema for response validation
+3. **Calls Claude** - Executes `claude --print <prompt> --output-format json --json-schema <schema>`
+4. **Parses Response** - Extracts structured findings from JSON output
 5. **Aggregates Results** - Combines findings from all rule groups
 6. **Formats Output** - Uses OutputFormatter to create comments and summary
 
@@ -101,41 +101,35 @@ I've reviewed the changes and have some feedback organized by priority.
 
 ### Components
 
-- **ACPEx**: Elixir implementation of the Agent Client Protocol
-- **ClaudeCodeClient**: Implements `ACPex.Client` behavior - responds to file/terminal requests from Claude Code
-- **ClaudeCodeProvider**: High-level API for spawning Claude Code and sending review prompts
+- **ClaudeCodeProvider**: Executes `claude --print` with review prompts and parses JSON responses
 - **Reviewer**: Orchestrator that chooses between OpenAI or Claude Code based on `LLM_PROVIDER`
+- **RuleGroups**: 9 focused rule groups for different review aspects
+- **OutputFormatter**: Formats findings into GitHub-ready comments
 
-### Protocol Flow
+### Command Flow
 
 ```
-┌──────────────────┐         ┌─────────────┐
-│  CodeReviewer    │────────▶│ Claude Code │
-│  (ACP Client)    │◀────────│ (ACP Agent) │
-└──────────────────┘  stdio  └─────────────┘
-   ClaudeCodeClient          JSON-RPC over stdio
+┌──────────────────┐
+│  CodeReviewer    │
+│  mix review      │
+└────────┬─────────┘
          │
-         │ spawns & manages
          ▼
    ┌──────────────────┐
    │ Reviewer         │
-   │ ├─ RuleGroups    │
-   │ ├─ GitHubClient  │ ──────▶ GitHub API (via gh)
-   │ └─ Provider      │
-   │    ├─ OpenAI     │ ──────▶ OpenAI API (direct)
-   │    └─ Claude Code│ ──────▶ Claude Code (via ACP)
-   └──────────────────┘
+   │ (orchestrator)   │
+   └────────┬─────────┘
+            │
+            ├─ LLM_PROVIDER=openai ────▶ OpenAI API (HTTP)
+            │
+            └─ LLM_PROVIDER=claude_code ▶ claude --print (CLI)
+                                           │
+                                           ▼
+                                    Claude Code CLI
+                                    - Reads prompt
+                                    - Enforces JSON schema
+                                    - Returns structured findings
 ```
-
-### Message Flow
-
-1. **CodeReviewer → Claude Code**: `initialize` (protocol handshake)
-2. **CodeReviewer → Claude Code**: `authenticate` (optional)
-3. **CodeReviewer → Claude Code**: `new` (create session)
-4. **CodeReviewer → Claude Code**: `prompt` (review request with rule group context)
-5. **Claude Code → CodeReviewer**: File read requests (if needed)
-6. **Claude Code → CodeReviewer**: Session updates (streaming thoughts/progress)
-7. **Claude Code → CodeReviewer**: Prompt response (structured JSON with findings)
 
 ## Implementation Details
 
@@ -144,36 +138,32 @@ I've reviewed the changes and have some feedback organized by priority.
 ```elixir
 def review_code(rule_group, diff_content, pr_info) do
   with {:ok, claude_path} <- find_claude_code(),
-       {:ok, conn_pid} <- start_claude_code(claude_path),
-       {:ok, session_id} <- initialize_session(conn_pid),
-       {:ok, response} <- send_review_prompt(conn_pid, session_id, rule_group, diff_content, pr_info) do
-    stop_claude_code(conn_pid)
-    parse_response(response)
+       {:ok, prompt} <- build_review_prompt(rule_group, diff_content, pr_info),
+       {:ok, result} <- call_claude_code(claude_path, prompt) do
+    parse_response(result)
   end
 end
 ```
 
-### ClaudeCodeClient Callbacks
+### Calling Claude Code
 
-The client implements `ACPex.Client` behavior to respond to Claude Code's requests:
+The provider executes Claude Code CLI with `--print` mode:
 
 ```elixir
-@impl ACPex.Client
-def handle_fs_read_text_file(%FsReadTextFileRequest{} = request, state) do
-  case File.read(resolve_path(request.path, state.cwd)) do
-    {:ok, content} ->
-      response = %FsReadTextFileResponse{content: content}
-      {:ok, response, state}
-    {:error, reason} ->
-      {:error, %{code: -32_001, message: "Failed to read file"}, state}
-  end
-end
+defp call_claude_code(claude_path, prompt) do
+  args = [
+    "--print",
+    prompt,
+    "--output-format", "json",
+    "--json-schema", @json_schema,
+    "--tools", "",  # Disable tools for safety
+    "--dangerously-skip-permissions"  # Skip prompts (read-only operation)
+  ]
 
-@impl ACPex.Client
-def handle_session_update(%UpdateNotification{} = notification, state) do
-  # Collect streaming updates (thoughts, progress, tool calls)
-  updated_state = %{state | updates: state.updates ++ [notification.update]}
-  {:noreply, updated_state}
+  case System.cmd(claude_path, args) do
+    {output, 0} -> parse_claude_output(output)
+    {error, code} -> {:error, "Claude exited with code #{code}: #{error}"}
+  end
 end
 ```
 
@@ -206,11 +196,14 @@ mix review owner/repo 123
 ### Verify Claude Code is Working
 
 ```bash
-# Check if Claude Code CLI is available
-which claude-code
+# Check if Claude CLI is available
+which claude
 
-# Test Claude Code directly
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}' | claude-code
+# Test Claude CLI with --print mode
+./bin/test_claude_code.sh
+
+# Or test manually
+claude --print "Say hello" --output-format json
 ```
 
 ## Troubleshooting
@@ -224,14 +217,24 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 2. Ensure it's in your PATH: `which claude-code`
 3. Or set explicitly: `export CLAUDE_CODE_PATH="/path/to/claude-code"`
 
-### Claude Code Doesn't Support ACP
+### Claude Code Authentication Required
 
-**Problem**: "Input must be provided either through stdin or as a prompt argument"
+**Problem**: Claude CLI returns authentication errors
 
-**Solution**: Your Claude Code CLI may not support ACP mode. This can happen if:
-- You're using the wrong version of Claude Code
-- Claude Code CLI doesn't have ACP support built-in
-- You need to pass specific flags (e.g., `--acp`)
+**Solution**:
+1. Authenticate with Claude: `claude auth`
+2. Verify authentication: `claude --print "hello" --output-format json`
+3. Check your Claude Code subscription is active
+
+### Claude Code Command Fails
+
+**Problem**: "Claude Code exited with code X"
+
+**Solution**:
+1. Test Claude CLI works: `claude --version`
+2. Try a simple test: `claude --print "Say hello" --output-format json`
+3. Check Claude Code logs for errors
+4. Ensure you have an active Claude subscription
 
 **Workaround**: Use OpenAI instead:
 ```bash
@@ -239,15 +242,6 @@ export OPENAI_API_KEY="sk-..."
 unset LLM_PROVIDER  # or set LLM_PROVIDER=openai
 mix review owner/repo 123
 ```
-
-### Connection Initialization Fails
-
-**Problem**: Timeout or error during `initialize_session`
-
-**Solution**:
-1. Verify Claude Code CLI works standalone
-2. Check if it requires authentication first
-3. Try starting it manually to see what arguments it expects
 
 ### GitHub Authentication Fails
 
@@ -267,34 +261,23 @@ mix review owner/repo 123
 2. Verify API key is valid
 3. Check OpenAI account has credits
 
-### No Response from Agent
-
-**Problem**: Commands sent but no response received
-
-**Solution**:
-1. Check agent logs for errors
-2. Verify JSON-RPC message format
-3. Ensure session was created before sending prompts
-4. Check that stdin/stdout aren't being buffered
-
 ## Resources
 
-- **ACP Specification**: https://agentclientprotocol.com/
-- **ACPex Library**: https://hexdocs.pm/acpex/
-- **Tidewave ACP Integration**: https://tidewave.ai/blog/the-future-of-coding-agents-is-vertical-integration
-- **Zed ACP Implementation**: https://github.com/zed-industries/claude-code-acp
+- **Claude Code CLI Documentation**: https://code.claude.com/docs/en/headless
+- **Claude Code --print mode guide**: https://code.claude.com/docs/en/headless
+- **Claude Product Page**: https://claude.com/product/claude-code
 
 ## Development
 
-To modify the ACP integration:
+To modify the Claude Code integration:
 
-1. Edit `lib/code_reviewer/acp_agent.ex`
-2. Implement additional `ACPex.Agent` callbacks as needed
-3. Update command parsing in `parse_review_command/1`
-4. Test with: `mix acp`
+1. Edit `lib/code_reviewer/claude_code_provider.ex`
+2. Update the JSON schema if needed (`@json_schema`)
+3. Modify prompt building in `build_review_prompt/3`
+4. Test with: `export LLM_PROVIDER=claude_code && mix review owner/repo 123`
 
-The agent leverages all existing CodeReviewer functionality:
+The provider leverages all existing CodeReviewer functionality:
 - `CodeReviewer.Reviewer` - Orchestration
 - `CodeReviewer.GitHubClient` - PR data fetching
-- `CodeReviewer.LLMClient` - OpenAI integration
+- `CodeReviewer.LLMClient` - OpenAI integration (alternative)
 - `CodeReviewer.OutputFormatter` - Response formatting

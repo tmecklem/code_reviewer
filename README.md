@@ -9,7 +9,7 @@ AI-powered code reviewer that thinks and reviews like Tim. Built with Elixir, us
 - Creates summary notes highlighting areas of concern and praise
 - Supports selective rule group application
 - Can post reviews directly to GitHub or output for manual review
-- **Agent Client Protocol (ACP) integration** - Can use Claude Code as LLM provider via ACP
+- **Multiple LLM providers** - Can use Claude Code CLI or OpenAI API
 
 ## Prerequisites
 
@@ -17,7 +17,7 @@ AI-powered code reviewer that thinks and reviews like Tim. Built with Elixir, us
 - GitHub CLI (`gh`) authenticated with your account
 - **Either**:
   - OpenAI API key (default)
-  - Claude Code CLI (for ACP integration)
+  - Claude Code CLI (alternative LLM provider)
 
 ## Installation
 
@@ -66,7 +66,7 @@ export OPENAI_API_KEY="your-key"
 mix review owner/repo 123
 ```
 
-### Using Claude Code (via ACP)
+### Using Claude Code
 
 ```bash
 export GITHUB_TOKEN="your-token"
@@ -74,7 +74,7 @@ export LLM_PROVIDER="claude_code"
 mix review owner/repo 123
 ```
 
-See [ACP_INTEGRATION.md](ACP_INTEGRATION.md) for detailed Claude Code setup.
+See [CLAUDE_CODE_INTEGRATION.md](CLAUDE_CODE_INTEGRATION.md) for detailed Claude Code setup.
 
 ### Command Options
 
@@ -119,7 +119,7 @@ Available rule groups:
 - `OPENAI_MODEL` - (Optional) Model to use (default: "gpt-4o")
 
 *Option 2: Claude Code*
-- `LLM_PROVIDER="claude_code"` - Enable Claude Code via ACP
+- `LLM_PROVIDER="claude_code"` - Use Claude Code CLI instead of OpenAI
 - `CLAUDE_CODE_PATH` - (Optional) Path to Claude Code CLI if not in PATH
 
 ## Architecture
@@ -127,9 +127,9 @@ Available rule groups:
 - **RuleGroups** - 9 focused rule groups derived from 1,241 analyzed PR comments
 - **GitHubClient** - Wrapper around `gh` CLI for fetching PR data
 - **LLMClient** - OpenAI API integration for code review
+- **ClaudeCodeProvider** - Claude Code CLI integration (alternative to OpenAI)
 - **Reviewer** - Main orchestrator coordinating the review workflow
 - **OutputFormatter** - Formats findings into GitHub-ready comments and summaries
-- **ACPAgent** - Agent Client Protocol server for editor integration
 
 ## Development
 
