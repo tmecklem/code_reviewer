@@ -75,7 +75,8 @@ defmodule CodeReviewer.GitHubClientTest do
         %{file: "lib/test.ex", line: 10, body: "Test comment"}
       ]
 
-      result = GitHubClient.create_pending_review("invalid-format", 1, "abc123", comments, "Summary")
+      result =
+        GitHubClient.create_pending_review("invalid-format", 1, "abc123", comments, "Summary")
 
       assert {:error, reason} = result
       assert reason =~ "format"

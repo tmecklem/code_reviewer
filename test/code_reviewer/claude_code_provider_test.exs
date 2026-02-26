@@ -93,14 +93,14 @@ defmodule CodeReviewer.ClaudeCodeProviderTest do
         "headRefName" => "feature-branch"
       }
 
-      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info)
+      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info, "")
       assert prompt =~ "Testing Strategy"
       assert prompt =~ "Write tests first"
       assert prompt =~ "Use TDD approach"
       assert prompt =~ "Tim loves TDD"
     end
 
-    test "includes git diff command with correct branches" do
+    test "includes git_diff tool instructions with correct branches" do
       rule_group = %{
         name: "Test Group",
         priority: :medium,
@@ -114,8 +114,11 @@ defmodule CodeReviewer.ClaudeCodeProviderTest do
         "headRefName" => "feature-123"
       }
 
-      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info)
-      assert prompt =~ "git diff develop...feature-123"
+      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info, "")
+      assert prompt =~ "git_diff"
+      assert prompt =~ "develop"
+      assert prompt =~ "feature-123"
+      assert prompt =~ "USE THIS FIRST"
     end
 
     test "defaults to main branch when baseRefName not provided" do
@@ -131,8 +134,10 @@ defmodule CodeReviewer.ClaudeCodeProviderTest do
         "headRefName" => "feature-branch"
       }
 
-      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info)
-      assert prompt =~ "git diff main...feature-branch"
+      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info, "")
+      assert prompt =~ "git_diff"
+      assert prompt =~ "main"
+      assert prompt =~ "feature-branch"
     end
 
     test "includes PR context information" do
@@ -151,7 +156,7 @@ defmodule CodeReviewer.ClaudeCodeProviderTest do
         "body" => "This PR fixes a critical auth bug"
       }
 
-      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info)
+      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info, "")
       assert prompt =~ "Fix bug in authentication"
       assert prompt =~ "developer"
       assert prompt =~ "This PR fixes a critical auth bug"
@@ -171,9 +176,8 @@ defmodule CodeReviewer.ClaudeCodeProviderTest do
         "headRefName" => "feature"
       }
 
-      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info)
-      assert prompt =~ "Return your findings as JSON"
-      assert prompt =~ "matching the schema provided"
+      assert {:ok, prompt} = ClaudeCodeProvider.build_review_prompt(rule_group, pr_info, "")
+      assert prompt =~ "Return findings as JSON"
     end
   end
 

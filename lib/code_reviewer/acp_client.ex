@@ -7,6 +7,7 @@ defmodule CodeReviewer.ACPClient do
   """
 
   require Logger
+  alias CodeReviewer.LoggerConfig
 
   @type message_handler :: (map() -> :ok)
 
@@ -47,14 +48,23 @@ defmodule CodeReviewer.ACPClient do
       npx_path ->
         Logger.info("Spawning claude-agent-acp in #{working_dir}")
 
+        Logger.info(
+          "Setting ACP_PERMISSION_MODE=bypassPermissions to bypass all permission checks"
+        )
+
         try do
           # Unset CLAUDECODE to allow nested sessions
+          # Add ACP_PERMISSION_MODE to bypass all permissions
           # Add this to the provided env list
-          env_with_unset = [{"CLAUDECODE", false} | env]
+          env_with_overrides = [
+            {"CLAUDECODE", false},
+            {"ACP_PERMISSION_MODE", "bypassPermissions"}
+            | env
+          ]
 
           # Convert env list to list of tuples format expected by Port
           port_env =
-            Enum.map(env_with_unset, fn
+            Enum.map(env_with_overrides, fn
               {k, v} when is_binary(k) and is_binary(v) ->
                 {String.to_charlist(k), String.to_charlist(v)}
 
@@ -72,12 +82,11 @@ defmodule CodeReviewer.ACPClient do
               [
                 :binary,
                 :exit_status,
-                {:args, [
-                  "--yes",
-                  "@zed-industries/claude-agent-acp",
-                  "--",
-                  "--dangerously-skip-permissions"
-                ]},
+                {:args,
+                 [
+                   "--yes",
+                   "@zed-industries/claude-agent-acp"
+                 ]},
                 {:cd, working_dir},
                 {:env, port_env},
                 {:line, 1024 * 1024},
@@ -102,10 +111,12 @@ defmodule CodeReviewer.ACPClient do
       params: %{
         protocolVersion: 1,
         capabilities: %{
-          tools: %{},
-          terminal: %{
-            execute: true,
-            manage: true
+          # Disable all terminal/bash operations (correct ACP format)
+          terminal: false,
+          # Allow reading files but not writing (for security)
+          fs: %{
+            readTextFile: true,
+            writeTextFile: false
           }
         },
         clientInfo: %{
@@ -115,7 +126,7 @@ defmodule CodeReviewer.ACPClient do
       }
     }
 
-    Logger.debug("Sending initialize request")
+    LoggerConfig.log_debug("ACP", "Sending initialize request (terminal: false, writeTextFile: false)")
     send_message(port, request)
 
     case wait_for_response(port, 1, on_message, 10_000) do
@@ -129,23 +140,34 @@ defmodule CodeReviewer.ACPClient do
   end
 
   defp create_session(port, on_message, working_dir) do
+    # Create session with HTTP MCP server configuration
+    # The claude-agent-acp reported it supports HTTP in mcpCapabilities
+    mcp_servers = [
+      %{
+        "type" => "http",
+        "name" => "code-reviewer-mcp",
+        "url" => "http://localhost:4567/rpc",
+        "headers" => []
+      }
+    ]
+
     request = %{
       jsonrpc: "2.0",
       id: 2,
       method: "session/new",
       params: %{
         cwd: working_dir,
-        mcpServers: []
+        mcpServers: mcp_servers
       }
     }
 
-    Logger.debug("Creating new session in #{working_dir}")
+    LoggerConfig.log_debug("ACP", "Creating new session in #{working_dir} with HTTP MCP server")
     send_message(port, request)
 
     case wait_for_response(port, 2, on_message, 10_000) do
       {:ok, response} ->
         session_id = response["result"]["sessionId"]
-        Logger.info("Created session: #{session_id}")
+        Logger.info("Created session: #{session_id} with git_diff MCP tool")
         {:ok, session_id}
 
       error ->
@@ -172,14 +194,42 @@ defmodule CodeReviewer.ACPClient do
     Logger.info("Sending prompt to session #{session_id}")
     send_message(port, request)
 
+    # Accumulate agent message chunks
+    {:ok, accumulator_pid} = Agent.start_link(fn -> "" end)
+
+    # Create a custom message handler that accumulates agent responses
+    accumulating_handler = fn message ->
+      on_message.(message)
+
+      # Extract agent message chunks from session updates
+      case message do
+        %{
+          "method" => "session/update",
+          "params" => %{
+            "update" => %{
+              "sessionUpdate" => "agent_message_chunk",
+              "content" => %{"text" => text}
+            }
+          }
+        } ->
+          Agent.update(accumulator_pid, fn current -> current <> text end)
+
+        _ ->
+          :ok
+      end
+    end
+
     # Wait for the final response
-    # Meanwhile, session/update notifications will be handled by on_message
-    case wait_for_response(port, 3, on_message, :infinity) do
-      {:ok, response} ->
+    # Meanwhile, session/update notifications will be handled by accumulating_handler
+    case wait_for_response(port, 3, accumulating_handler, :infinity) do
+      {:ok, _response} ->
         Logger.info("Session completed")
-        {:ok, response["result"]}
+        result = Agent.get(accumulator_pid, & &1)
+        Agent.stop(accumulator_pid)
+        {:ok, result}
 
       error ->
+        Agent.stop(accumulator_pid)
         error
     end
   end
@@ -197,6 +247,14 @@ defmodule CodeReviewer.ACPClient do
         {^port, {:data, {:eol, line}}} ->
           case Jason.decode(line) do
             {:ok, message} ->
+              # Handle permission requests specially with the correct ID
+              if message["method"] == "session/request_permission" do
+                LoggerConfig.log_debug("Permission", "Raw message: #{inspect(message)}")
+                # Permission requests should have an ID for the JSON-RPC response
+                request_id = Map.get(message, "id", 0)
+                handle_permission_request_with_port(port, request_id, message["params"])
+              end
+
               # Call the message handler for all messages
               on_message.(message)
 
@@ -229,6 +287,50 @@ defmodule CodeReviewer.ACPClient do
     wait_loop.(wait_loop)
   end
 
+  defp handle_permission_request_with_port(port, id, params) do
+    LoggerConfig.log_debug("Permission Request", "ID: #{inspect(id)}, Full params: #{inspect(params)}")
+
+    # Find the "allow_always" or "allow_once" option
+    option =
+      Enum.find(params["options"], fn opt ->
+        LoggerConfig.log_debug("Permission", "Checking option: #{inspect(opt)}")
+        opt["kind"] == "allow_always" || opt["kind"] == "allow_once"
+      end)
+
+    if option do
+      Logger.info("[Permission] Auto-approving: #{option["name"]}")
+      LoggerConfig.log_debug("Permission", "Selected option: #{inspect(option)}")
+
+      # Send the response to approve the permission
+      response = %{
+        jsonrpc: "2.0",
+        id: id,
+        result: %{
+          # Fixed: was option["id"], should be optionId
+          selection: option["optionId"]
+        }
+      }
+
+      LoggerConfig.log_debug("Permission", "Sending response: #{inspect(response)}")
+      send_message(port, response)
+      LoggerConfig.log_debug("Permission", "Sent permission approval response")
+    else
+      Logger.warning("[Permission] No allow option found in: #{inspect(params["options"])}")
+
+      # Send error response
+      response = %{
+        jsonrpc: "2.0",
+        id: id,
+        error: %{
+          code: -32603,
+          message: "No allow option available"
+        }
+      }
+
+      send_message(port, response)
+    end
+  end
+
   defp check_timeout(:infinity, _start_time, wait_loop_fn) do
     wait_loop_fn.(wait_loop_fn)
   end
@@ -254,39 +356,20 @@ defmodule CodeReviewer.ACPClient do
       %{"method" => "session/update", "params" => params} ->
         log_session_update(params)
 
-      %{"method" => "session/request_permission", "params" => params} = msg ->
+      %{"method" => "session/request_permission", "params" => params} ->
         Logger.info("[Permission Request] #{inspect(params["toolCall"])}")
-        # Auto-approve permission requests in non-interactive mode
-        handle_permission_request(msg)
+        # Note: Permission requests need to be handled in the context with port access
+        # This handler just logs the request
+        :ok
 
       %{"id" => id, "result" => _result} ->
-        Logger.debug("Received response for request #{id}")
+        LoggerConfig.log_debug("ACP", "Received response for request #{id}")
 
       %{"id" => id, "error" => error} ->
         Logger.error("Received error for request #{id}: #{inspect(error)}")
 
       _ ->
-        Logger.debug("Received message: #{inspect(message)}")
-    end
-  end
-
-  defp handle_permission_request(%{"id" => id, "params" => params}) do
-    # Find the "allow_always" or "allow" option
-    option =
-      Enum.find(params["options"], fn opt ->
-        opt["kind"] == "allow_always" || opt["kind"] == "allow_once"
-      end)
-
-    if option do
-      Logger.info("[Permission] Auto-approving: #{option["name"]}")
-
-      # Send the response to approve the permission
-      # Note: We need access to the port here, but default_message_handler doesn't have it
-      # This is a limitation - we'll need to restructure to handle this properly
-      :ok
-    else
-      Logger.warning("[Permission] No allow option found")
-      :ok
+        LoggerConfig.log_debug("ACP", "Received message: #{inspect(message)}")
     end
   end
 
@@ -299,18 +382,35 @@ defmodule CodeReviewer.ACPClient do
 
       %{"type" => "tool_use", "name" => name, "input" => input} ->
         Logger.info("[Tool Call] #{name}")
-        Logger.debug("Tool input: #{inspect(input)}")
+        LoggerConfig.log_debug("Tool", "Input: #{inspect(input)}")
 
       %{"type" => "tool_result", "tool_use_id" => tool_id, "content" => result} ->
         Logger.info("[Tool Result] #{tool_id}")
-        Logger.debug("Tool result: #{inspect(result)}")
+
+        # Show the actual tool result content
+        case result do
+          [%{"type" => "text", "text" => text}] ->
+            Logger.info("Output: #{text}")
+
+          list when is_list(list) ->
+            Enum.each(list, fn
+              %{"type" => "text", "text" => text} ->
+                Logger.info("Output: #{text}")
+
+              other ->
+                Logger.info("Output: #{inspect(other)}")
+            end)
+
+          other ->
+            Logger.info("Output: #{inspect(other)}")
+        end
 
       %{"type" => "thinking"} = thinking ->
         thinking_text = Map.get(thinking, "thinking", "...")
         Logger.info("[Thinking] #{thinking_text}")
 
       other ->
-        Logger.debug("[Content] #{inspect(other)}")
+        LoggerConfig.log_debug("Content", inspect(other))
     end)
   end
 
@@ -318,11 +418,38 @@ defmodule CodeReviewer.ACPClient do
     Logger.info("[Plan] #{inspect(plan)}")
   end
 
+  defp log_session_update(%{"sessionId" => _session_id, "update" => update} = _params) do
+    # Parse ACP session updates for readable progress logging
+    case update do
+      %{"sessionUpdate" => "tool_call", "title" => title, "status" => "pending"} ->
+        IO.puts("  → #{title}")
+
+      %{"sessionUpdate" => "tool_call_update", "title" => title, "status" => "completed"} ->
+        IO.puts("  ✓ #{title}")
+
+      %{"sessionUpdate" => "tool_call_update", "title" => title, "status" => "failed"} ->
+        IO.puts("  ✗ #{title} (failed)")
+
+      %{"sessionUpdate" => "agent_message_chunk", "content" => %{"text" => text}}
+      when text != "" ->
+        # Stream agent thinking/responses without newline
+        IO.write(text)
+
+      %{"sessionUpdate" => "available_commands_update"} ->
+        # Skip verbose command listings
+        :ok
+
+      _ ->
+        # Log other updates at debug level
+        LoggerConfig.log_debug("Session Update", inspect(update))
+    end
+  end
+
   defp log_session_update(%{"type" => type} = params) do
-    Logger.debug("[Session Update: #{type}] #{inspect(params)}")
+    LoggerConfig.log_debug("Session Update: #{type}", inspect(params))
   end
 
   defp log_session_update(params) do
-    Logger.debug("[Session Update] #{inspect(params)}")
+    LoggerConfig.log_debug("Session Update", inspect(params))
   end
 end

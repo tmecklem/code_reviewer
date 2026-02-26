@@ -83,18 +83,20 @@ defmodule CodeReviewer.GitHubClient do
 
       # Create pending review with comments
       # Omitting 'event' parameter creates a PENDING review
-      payload = Jason.encode!(%{
-        commit_id: commit_sha,
-        body: body,
-        comments: Enum.map(comments, fn comment ->
-          %{
-            path: comment.file,
-            line: comment.line,
-            side: "RIGHT",
-            body: comment.body
-          }
-        end)
-      })
+      payload =
+        Jason.encode!(%{
+          commit_id: commit_sha,
+          body: body,
+          comments:
+            Enum.map(comments, fn comment ->
+              %{
+                path: comment.file,
+                line: comment.line,
+                side: "RIGHT",
+                body: comment.body
+              }
+            end)
+        })
 
       # Use echo to pipe JSON payload to gh api
       cmd = "echo '#{String.replace(payload, "'", "'\\''")}' | gh api #{api_path} --input -"
@@ -128,7 +130,12 @@ defmodule CodeReviewer.GitHubClient do
   """
   def delete_review(repo, pr_number, review_id) do
     with :ok <- validate_repo_format(repo) do
-      case run_gh(["api", "-X", "DELETE", "repos/#{repo}/pulls/#{pr_number}/reviews/#{review_id}"]) do
+      case run_gh([
+             "api",
+             "-X",
+             "DELETE",
+             "repos/#{repo}/pulls/#{pr_number}/reviews/#{review_id}"
+           ]) do
         {:ok, _} -> :ok
         error -> error
       end
@@ -146,8 +153,11 @@ defmodule CodeReviewer.GitHubClient do
 
         Enum.each(pending_reviews, fn review ->
           case delete_review(repo, pr_number, review["id"]) do
-            :ok -> Logger.debug("Deleted pending review #{review["id"]}")
-            {:error, reason} -> Logger.warning("Failed to delete review #{review["id"]}: #{reason}")
+            :ok ->
+              Logger.debug("Deleted pending review #{review["id"]}")
+
+            {:error, reason} ->
+              Logger.warning("Failed to delete review #{review["id"]}: #{reason}")
           end
         end)
 

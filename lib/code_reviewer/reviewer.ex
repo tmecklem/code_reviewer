@@ -1,10 +1,11 @@
 defmodule CodeReviewer.Reviewer do
   @moduledoc """
   Main orchestrator for code reviews.
-  Coordinates GitHub client, LLM client, and rule groups to perform reviews.
+  Coordinates GitHub client, Claude Code provider, and rule groups to perform reviews.
   """
 
-  alias CodeReviewer.{ClaudeCodeProvider, GitHubClient, LLMClient, OutputFormatter, RuleGroups}
+  require Logger
+  alias CodeReviewer.{ClaudeCodeProvider, GitHubClient, OutputFormatter, RuleGroups}
 
   @doc """
   Reviews a PR using all default rule groups.
@@ -85,89 +86,81 @@ defmodule CodeReviewer.Reviewer do
     with {:ok, pr_info} <- GitHubClient.fetch_pr_info(repo, pr_number),
          {:ok, diff} <- GitHubClient.fetch_pr_diff(repo, pr_number),
          {:ok, files} <- GitHubClient.fetch_pr_files(repo, pr_number) do
-      findings = review_with_rule_groups(rule_groups, diff, pr_info, repo)
+      case review_with_rule_groups(rule_groups, diff, pr_info, repo) do
+        {:ok, findings} ->
+          {:ok,
+           %{
+             pr_info: pr_info,
+             files: files,
+             findings: findings
+           }}
 
-      {:ok,
-       %{
-         pr_info: pr_info,
-         files: files,
-         findings: findings
-       }}
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
   defp review_with_rule_groups(rule_groups, diff, pr_info, repo) do
-    require Logger
-    provider = get_llm_provider()
+    alias CodeReviewer.LoggerConfig
 
-    # For ClaudeCodeProvider, clone once and run reviews in parallel
-    if provider == ClaudeCodeProvider do
-      review_with_claude_code(rule_groups, diff, pr_info, repo, provider)
-    else
-      # For other providers, run sequentially without cloning
-      rule_groups
-      |> Enum.map(fn rule_group ->
-        case provider.review_code(rule_group, diff, pr_info, repo) do
-          {:ok, result} ->
-            Map.get(result, "findings", [])
-
-          {:error, reason} ->
-            Logger.error("Review failed for rule group '#{rule_group.name}': #{inspect(reason)}")
-            []
-        end
-      end)
-      |> List.flatten()
-    end
-  end
-
-  defp review_with_claude_code(rule_groups, diff, pr_info, repo, provider) do
-    require Logger
-
-    # Clone the repo once
-    case provider.clone_repo(repo, pr_info) do
+    # Clone the repo once and run reviews sequentially
+    case ClaudeCodeProvider.clone_repo(repo, pr_info) do
       {:ok, temp_dir} ->
         try do
-          Logger.info("Running #{length(rule_groups)} reviews in parallel")
+          LoggerConfig.log_progress("Review", "Running #{length(rule_groups)} rule groups")
 
-          # Run reviews in parallel
-          rule_groups
-          |> Task.async_stream(
-            fn rule_group ->
-              case provider.review_code(rule_group, diff, pr_info, repo, temp_dir) do
+          # Run reviews sequentially
+          results =
+            rule_groups
+            |> Enum.with_index(1)
+            |> Enum.map(fn {rule_group, index} ->
+              LoggerConfig.log_progress(
+                "Review",
+                "Processing (#{index}/#{length(rule_groups)})",
+                group: rule_group.name
+              )
+
+              case ClaudeCodeProvider.review_code(rule_group, diff, pr_info, repo, temp_dir) do
                 {:ok, result} ->
-                  Map.get(result, "findings", [])
+                  findings = Map.get(result, "findings", [])
+                  LoggerConfig.log_summary("✓ #{rule_group.name}", "Found #{length(findings)} issues")
+                  {:ok, findings}
 
                 {:error, reason} ->
-                  Logger.error(
-                    "Review failed for rule group '#{rule_group.name}': #{inspect(reason)}"
-                  )
-
-                  []
+                  LoggerConfig.log_debug("Review", "Failed: #{inspect(reason)}")
+                  LoggerConfig.log_summary("✗ #{rule_group.name}", "Failed")
+                  {:error, reason}
               end
-            end,
-            timeout: :infinity,
-            max_concurrency: System.schedulers_online()
-          )
-          |> Enum.flat_map(fn
-            {:ok, findings} -> findings
-            {:exit, reason} ->
-              Logger.error("Review task crashed: #{inspect(reason)}")
-              []
-          end)
+            end)
+
+          # Check if all reviews failed
+          all_failed? =
+            Enum.all?(results, fn
+              {:error, _} -> true
+              _ -> false
+            end)
+
+          if all_failed? do
+            {:error, "All reviews failed"}
+          else
+            # Collect findings from successful reviews
+            findings =
+              results
+              |> Enum.flat_map(fn
+                {:ok, findings} -> findings
+                {:error, _} -> []
+              end)
+
+            {:ok, findings}
+          end
         after
-          provider.cleanup_temp_repo(temp_dir)
+          ClaudeCodeProvider.cleanup_temp_repo(temp_dir)
         end
 
       {:error, reason} ->
         Logger.error("Failed to clone repo: #{inspect(reason)}")
-        []
-    end
-  end
-
-  defp get_llm_provider do
-    case Application.get_env(:code_reviewer, :llm_provider, "openai") do
-      "claude_code" -> ClaudeCodeProvider
-      _ -> LLMClient
+        {:error, "Failed to clone repo: #{inspect(reason)}"}
     end
   end
 end

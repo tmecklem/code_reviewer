@@ -40,10 +40,9 @@ usage() {
     echo ""
     echo "Environment Variables:"
     echo "  GITHUB_TOKEN           Required for GitHub access"
-    echo "  LLM_PROVIDER           'claude_code' (default) or 'openai'"
-    echo "  ANTHROPIC_API_KEY      Required for Claude Code (default provider)"
-    echo "  OPENAI_API_KEY         Required if using OpenAI"
-    echo "  OPENAI_MODEL           Optional, defaults to gpt-4o"
+    echo ""
+    echo "Requirements:"
+    echo "  - Authenticated Claude Code session (run: claude login)"
     exit 1
 }
 
@@ -103,36 +102,6 @@ if [[ -z "$GITHUB_TOKEN" ]]; then
     exit 1
 fi
 
-# Determine LLM provider and validate API keys
-LLM_PROVIDER="${LLM_PROVIDER:-claude_code}"
-
-if [[ "$LLM_PROVIDER" == "claude_code" ]]; then
-    if [[ -n "$ANTHROPIC_API_KEY" ]]; then
-        # Using API key authentication
-        PROVIDER_ENV="-e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
-        PROVIDER_NAME="Claude Code (API Key)"
-    else
-        # Will attempt to use mounted authenticated session
-        PROVIDER_ENV=""
-        PROVIDER_NAME="Claude Code (Authenticated Session)"
-    fi
-elif [[ "$LLM_PROVIDER" == "openai" ]]; then
-    if [[ -z "$OPENAI_API_KEY" ]]; then
-        echo -e "${RED}Error: OPENAI_API_KEY environment variable is required for OpenAI${NC}"
-        echo "Set it with: export OPENAI_API_KEY='sk-...'"
-        exit 1
-    fi
-    PROVIDER_ENV="-e OPENAI_API_KEY=$OPENAI_API_KEY -e LLM_PROVIDER=openai"
-    if [[ -n "$OPENAI_MODEL" ]]; then
-        PROVIDER_ENV="$PROVIDER_ENV -e OPENAI_MODEL=$OPENAI_MODEL"
-    fi
-    PROVIDER_NAME="OpenAI"
-else
-    echo -e "${RED}Error: Invalid LLM_PROVIDER: $LLM_PROVIDER${NC}"
-    echo "Must be 'claude_code' or 'openai'"
-    exit 1
-fi
-
 # Print configuration
 echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║  CodeReviewer Docker One-Shot Review  ║${NC}"
@@ -140,7 +109,6 @@ echo -e "${BLUE}╚════════════════════�
 echo ""
 echo -e "${GREEN}Repository:${NC}    $REPO"
 echo -e "${GREEN}PR Number:${NC}     $PR_NUMBER"
-echo -e "${GREEN}LLM Provider:${NC}  $PROVIDER_NAME"
 if [[ ${#MIX_ARGS[@]} -gt 0 ]]; then
     echo -e "${GREEN}Options:${NC}       ${MIX_ARGS[*]}"
 fi
@@ -164,29 +132,19 @@ fi
 echo -e "${YELLOW}Starting review...${NC}"
 echo ""
 
-# Check if we should mount Claude Code config for authenticated session
-VOLUME_MOUNTS=""
-if [[ "$LLM_PROVIDER" == "claude_code" ]] && [[ -z "$ANTHROPIC_API_KEY" ]]; then
-    # Use locally authenticated Claude Code session
-    CLAUDE_CONFIG_DIR="${HOME}/.claude"
-    if [[ -d "$CLAUDE_CONFIG_DIR" ]]; then
-        echo -e "${GREEN}✓ Using authenticated Claude Code session from host${NC}"
-        VOLUME_MOUNTS="-v ${CLAUDE_CONFIG_DIR}:/home/appuser/.claude"
-        PROVIDER_ENV=""  # Don't need API key if using mounted session
-    else
-        echo -e "${RED}Error: Claude Code not authenticated and no ANTHROPIC_API_KEY provided${NC}"
-        echo "Either:"
-        echo "  1. Authenticate Claude Code: claude login"
-        echo "  2. Set ANTHROPIC_API_KEY: export ANTHROPIC_API_KEY='sk-ant-...'"
-        exit 1
-    fi
+# Mount Claude Code session from host
+CLAUDE_CONFIG_DIR="${HOME}/.claude"
+if [[ ! -d "$CLAUDE_CONFIG_DIR" ]]; then
+    echo -e "${RED}Error: Claude Code not authenticated on host${NC}"
+    echo "Run: claude login"
+    exit 1
 fi
+
+echo -e "${GREEN}✓ Using authenticated Claude Code session from host${NC}"
 
 docker run --rm \
     -e GITHUB_TOKEN="$GITHUB_TOKEN" \
-    -e LLM_PROVIDER="$LLM_PROVIDER" \
-    $VOLUME_MOUNTS \
-    $PROVIDER_ENV \
+    -v "${CLAUDE_CONFIG_DIR}:/home/appuser/.claude:ro" \
     "$IMAGE_NAME" \
     review "$REPO" "$PR_NUMBER" "${MIX_ARGS[@]}"
 

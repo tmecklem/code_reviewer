@@ -2,16 +2,12 @@ defmodule CodeReviewer.ClaudeCodeProvider do
   @moduledoc """
   Provider for using Claude Code CLI for code reviews.
 
-  Supports two modes:
-  - ACP mode: Uses Agent Client Protocol for streaming visibility (default)
-  - Print mode: Uses --print flag for one-shot execution (fallback)
-
-  Set CLAUDE_CODE_MODE=print to use print mode instead of ACP.
+  Uses Agent Client Protocol (ACP) for streaming visibility into the review process.
   """
 
   require Logger
 
-  alias CodeReviewer.ACPClient
+  alias CodeReviewer.{ACPClient, LoggerConfig}
 
   @json_schema """
   {
@@ -44,9 +40,9 @@ defmodule CodeReviewer.ClaudeCodeProvider do
 
   Returns {:ok, response} with findings or {:error, reason}.
   """
-  def review_code(rule_group, _diff_content, pr_info, _repo, temp_dir) when is_binary(temp_dir) do
+  def review_code(rule_group, diff_content, pr_info, _repo, temp_dir) when is_binary(temp_dir) do
     with {:ok, claude_path} <- find_claude_code(),
-         {:ok, prompt} <- build_review_prompt(rule_group, pr_info),
+         {:ok, prompt} <- build_review_prompt(rule_group, pr_info, diff_content),
          {:ok, output} <- call_claude_code_in_repo(claude_path, prompt, temp_dir) do
       parse_claude_response(output)
     else
@@ -62,13 +58,13 @@ defmodule CodeReviewer.ClaudeCodeProvider do
 
   Returns {:ok, response} with findings or {:error, reason}.
   """
-  def review_code(rule_group, _diff_content, pr_info, repo) do
+  def review_code(rule_group, diff_content, pr_info, repo) do
     temp_dir = nil
 
     try do
       with {:ok, claude_path} <- find_claude_code(),
            {:ok, temp_dir} <- clone_repo_internal(repo, pr_info),
-           {:ok, prompt} <- build_review_prompt(rule_group, pr_info),
+           {:ok, prompt} <- build_review_prompt(rule_group, pr_info, diff_content),
            {:ok, output} <- call_claude_code_in_repo(claude_path, prompt, temp_dir) do
         parse_claude_response(output)
       else
@@ -102,7 +98,7 @@ defmodule CodeReviewer.ClaudeCodeProvider do
 
     # Clean up if directory exists from a previous failed run
     if File.exists?(temp_dir) do
-      Logger.debug("Cleaning up existing temp dir: #{temp_dir}")
+      LoggerConfig.log_debug("ClaudeCode", "Cleaning up existing temp dir: #{temp_dir}")
       File.rm_rf(temp_dir)
     end
 
@@ -111,18 +107,23 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     # Clone the repo
     case System.cmd("gh", ["repo", "clone", repo, temp_dir], stderr_to_stdout: true) do
       {_, 0} ->
-        # Fetch the PR branches
-        case System.cmd("git", ["fetch", "origin", "#{head_branch}:#{head_branch}"],
-               cd: temp_dir,
-               stderr_to_stdout: true
-             ) do
-          {_, 0} ->
-            Logger.info("Fetched branch #{head_branch}, base is #{base_branch}")
-            {:ok, temp_dir}
-
+        # Fetch and checkout the PR branch
+        with {_, 0} <-
+               System.cmd("git", ["fetch", "origin", "#{head_branch}:#{head_branch}"],
+                 cd: temp_dir,
+                 stderr_to_stdout: true
+               ),
+             {_, 0} <-
+               System.cmd("git", ["checkout", head_branch],
+                 cd: temp_dir,
+                 stderr_to_stdout: true
+               ) do
+          Logger.info("Checked out branch #{head_branch}, base is #{base_branch}")
+          {:ok, temp_dir}
+        else
           {error, _} ->
             cleanup_temp_repo(temp_dir)
-            {:error, "Failed to fetch PR branch: #{error}"}
+            {:error, "Failed to fetch/checkout PR branch: #{error}"}
         end
 
       {error, _} ->
@@ -136,13 +137,13 @@ defmodule CodeReviewer.ClaudeCodeProvider do
 
   def cleanup_temp_repo(temp_dir) do
     if File.exists?(temp_dir) do
-      Logger.debug("Cleaning up temp repo: #{temp_dir}")
+      LoggerConfig.log_debug("ClaudeCode", "Cleaning up temp repo: #{temp_dir}")
       File.rm_rf(temp_dir)
     end
   end
 
   @doc false
-  def build_review_prompt(rule_group, pr_info) do
+  def build_review_prompt(rule_group, pr_info, _diff_content) do
     pr_context = build_pr_context(pr_info)
     base_branch = Map.get(pr_info, "baseRefName", "main")
     head_branch = Map.get(pr_info, "headRefName", "HEAD")
@@ -163,15 +164,49 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     #{pr_context}
 
     ## Your Task:
-    You are currently in a git repository with the PR code checked out.
+    You are in a git repository. The PR branch (#{head_branch}) is ALREADY CHECKED OUT.
 
-    1. Run `git diff #{base_branch}...#{head_branch}` to see the changes in this PR
-    2. Review the diff according to the rules above
-    3. Return your findings as JSON matching the schema provided
+    ## CRITICAL INSTRUCTIONS:
+    - **DO NOT USE BASH or Terminal commands** - These are DISABLED for security
+    - **USE ONLY the tools available to you**
+    - **NEVER run git commands directly** - Use the git_diff MCP tool instead
+
+    ## Available MCP Tools:
+    You have access to git_diff tool via the MCP server:
+    1. **git_diff**: (REQUIRED - USE THIS FIRST!)
+       - Purpose: Get the diff between branches
+       - Usage: Call with arguments: {"ref1": "#{base_branch}", "ref2": "#{head_branch}", "three_dot": true}
+       - For large diffs: Add "limit": 5000 to chunk the response
+       - Continue with: {"ref1": "#{base_branch}", "ref2": "#{head_branch}", "offset": 5000, "limit": 5000}
+
+    ## Available Built-in Tools:
+    - **Read**: Read specific files for context
+    - **Grep**: Search for patterns in files (if available)
+    - **Glob**: Find files by pattern (if available)
+
+    Terminal/Bash commands are COMPLETELY DISABLED. Any attempt to use them will fail.
+
+    ## Steps (FOLLOW EXACTLY):
+    1. **MANDATORY FIRST STEP**: Call the git_diff tool from the MCP server
+       - DO NOT use "git diff" command in bash/terminal (it won't work)
+       - The tool should be available as: mcp__code-reviewer-mcp__git_diff
+    2. If response has hasMore: true, continue fetching chunks:
+       - Call again with offset parameter
+       - Repeat until hasMore: false
+    3. Review all changes according to the rules above
+    4. Use Read tool if needed for additional context
+    5. Return findings as JSON
+
+    ## FORBIDDEN ACTIONS:
+    - ❌ NO bash commands (git, cat, ls, etc.)
+    - ❌ NO terminal commands
+    - ❌ NO direct command execution
+    - ✅ ONLY use the tools available to you
 
     Important:
+    - The git_diff tool is an MCP tool, NOT a bash command
     - Only flag actual issues you find
-    - Be specific with file paths and line numbers from the diff
+    - Be specific with file paths and line numbers
     - Quote the exact code when relevant
     - Match Tim's tone: start positive if things look good, be directive about issues
     - If no issues found, return empty findings array with positive summary
@@ -181,16 +216,6 @@ defmodule CodeReviewer.ClaudeCodeProvider do
   end
 
   defp call_claude_code_in_repo(_claude_path, prompt, repo_dir) do
-    mode = Application.get_env(:code_reviewer, :claude_code_mode, "acp")
-
-    case mode do
-      "acp" -> call_with_acp(prompt, repo_dir)
-      "print" -> call_with_print(prompt, repo_dir)
-      _ -> call_with_acp(prompt, repo_dir)
-    end
-  end
-
-  defp call_with_acp(prompt, repo_dir) do
     Logger.info("Using ACP mode for Claude Code (streaming enabled)")
 
     # Add JSON schema instruction to the prompt
@@ -205,14 +230,21 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     #{@json_schema}
     ```
 
-    Return ONLY the JSON object, no markdown code fences, no explanations before or after.
+    CRITICAL: Keep your output concise!
+    - Limit "suggestion" fields to 100 characters max
+    - Limit "issue" fields to 100 characters max
+    - Limit "quote" fields to 50 characters max
+    - Include at most 10 findings total
+    - Return ONLY the JSON object, no markdown code fences, no explanations before or after
     """
 
-    case ACPClient.run_session(enhanced_prompt,
-           working_dir: repo_dir,
-           env: [{"ANTHROPIC_API_KEY", get_anthropic_api_key()}]
-         ) do
+    case ACPClient.run_session(enhanced_prompt, working_dir: repo_dir) do
       {:ok, result} ->
+        # Add separator between agent log and review output
+        IO.puts("\n\n" <> String.duplicate("=", 80))
+        IO.puts("REVIEW RESULTS")
+        IO.puts(String.duplicate("=", 80) <> "\n")
+
         # The result should contain the final response
         extract_json_from_acp_result(result)
 
@@ -221,59 +253,10 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     end
   end
 
-  defp call_with_print(prompt, repo_dir) do
-    Logger.info("Using print mode for Claude Code (no streaming)")
-
-    # Write prompt to temp file
-    prompt_file =
-      Path.join(System.tmp_dir!(), "claude_prompt_#{:erlang.unique_integer([:positive])}.txt")
-
-    File.write!(prompt_file, prompt)
-
-    # Find claude binary
-    {:ok, claude_path} = find_claude_code()
-
-    try do
-      bash_cmd =
-        "cd #{repo_dir} && cat #{prompt_file} | #{claude_path} --print --output-format json --json-schema '#{@json_schema}' --model claude-sonnet-4-6 --debug --dangerously-skip-permissions"
-
-      Logger.debug("Executing: #{bash_cmd}")
-
-      case System.cmd("bash", ["-c", bash_cmd], stderr_to_stdout: true) do
-        {output, 0} ->
-          # Check if the response indicates an error
-          case Jason.decode(output) do
-            {:ok, %{"type" => "result", "subtype" => "error_during_execution"} = result} ->
-              Logger.error("Claude Code error_during_execution: #{inspect(result)}")
-              {:error, "Claude Code encountered an error during execution: #{inspect(result)}"}
-
-            _ ->
-              {:ok, output}
-          end
-
-        {error_output, exit_code} ->
-          {:error, "Claude Code exited with code #{exit_code}: #{error_output}"}
-      end
-    after
-      File.rm(prompt_file)
-    end
-  end
-
-  defp get_anthropic_api_key do
-    case System.get_env("ANTHROPIC_API_KEY") do
-      nil ->
-        Logger.warning("ANTHROPIC_API_KEY not set, ACP mode may fail")
-        ""
-
-      key ->
-        key
-    end
-  end
-
   defp extract_json_from_acp_result(result) do
     # The result from ACP session contains the final response
     # We need to extract the JSON from it
-    Logger.debug("ACP result: #{inspect(result)}")
+    LoggerConfig.log_debug("ClaudeCode", "ACP result: #{inspect(result)}")
 
     case result do
       # If it's already a map with the expected structure

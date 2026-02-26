@@ -79,6 +79,11 @@ RUN apt-get update -qq && \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js (required for ACP client via npx)
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
+    apt-get install --no-install-recommends -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install Claude Code CLI
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
@@ -156,24 +161,15 @@ if [ -z "$GITHUB_TOKEN" ]; then
   exit 1
 fi
 
-# Check if Claude Code authentication is available
-# Either via mounted config or ANTHROPIC_API_KEY
-if [ "${LLM_PROVIDER:-claude_code}" = "claude_code" ]; then
-  if [ ! -d "/home/appuser/.claude" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
-    echo "ERROR: Claude Code requires either:"
-    echo "  1. Mounted authentication: -v ~/.claude:/home/appuser/.claude"
-    echo "  2. API key: -e ANTHROPIC_API_KEY=sk-ant-..."
-    exit 1
-  fi
+# Check if Claude Code authentication is mounted
+if [ ! -d "/home/appuser/.claude" ]; then
+  echo "ERROR: Claude Code session not mounted"
+  echo "Run with: -v ~/.claude:/home/appuser/.claude:ro"
+  exit 1
 fi
 
 # Authenticate gh CLI (ignore exit code 1 which is just a warning about env var usage)
 echo "$GITHUB_TOKEN" | gh auth login --with-token || true
-
-# Export ANTHROPIC_API_KEY if provided (for non-mounted auth)
-if [ -n "$ANTHROPIC_API_KEY" ]; then
-  export ANTHROPIC_API_KEY
-fi
 
 # Set production environment
 export MIX_ENV=prod
