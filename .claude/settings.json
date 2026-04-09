@@ -1,0 +1,13 @@
+{
+  "defaultMode": "bypassPermissions",
+  "permissions": {
+    "allow": [
+      "mcp__code-reviewer-mcp",
+      "mcp__code-reviewer-mcp__*",
+      "mcp__code-reviewer-mcp__git_diff",
+      "mcp__code-reviewer-mcp__add_feedback",
+      "mcp__code-reviewer-mcp__get_feedback",
+      "mcp__code-reviewer-mcp__clear_feedback"
+    ]
+  }
+}

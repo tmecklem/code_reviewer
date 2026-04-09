@@ -29,20 +29,25 @@ usage() {
     echo "Options:"
     echo "  --groups      Comma-separated list of rule groups (blocking,testing,quality,etc.)"
     echo "  --post        Post review comments to GitHub"
+    echo "  --debug       Enable debug logging"
     echo "  --rebuild     Force rebuild of Docker image"
     echo "  --help        Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0 tmecklem/code_reviewer 123"
     echo "  $0 https://github.com/tmecklem/code_reviewer/pull/123"
+    echo "  $0 tmecklem/code_reviewer 123 --debug"
     echo "  $0 tmecklem/code_reviewer 123 --groups quality,testing"
     echo "  $0 tmecklem/code_reviewer 123 --post"
     echo ""
     echo "Environment Variables:"
     echo "  GITHUB_TOKEN           Required for GitHub access"
+    echo "  MCP_PORT              MCP server port (default: 4567)"
     echo ""
-    echo "Requirements:"
-    echo "  - Authenticated Claude Code session (run: claude login)"
+    echo "Notes:"
+    echo "  - Claude authentication is required - ensure you're logged in via 'claude login'"
+    echo "  - Your ~/.claude directory will be mounted read-only in the container"
+    echo "  - MCP server runs automatically inside container"
     exit 1
 }
 
@@ -61,7 +66,7 @@ while [[ $# -gt 0 ]]; do
             REBUILD=true
             shift
             ;;
-        --groups|--post)
+        --groups|--post|--debug)
             MIX_ARGS+=("$1")
             if [[ $1 == "--groups" ]]; then
                 shift
@@ -120,7 +125,12 @@ IMAGE_NAME="code-reviewer:latest"
 if [[ "$REBUILD" == true ]] || ! docker image inspect "$IMAGE_NAME" &> /dev/null; then
     echo -e "${YELLOW}Building Docker image...${NC}"
     cd "$PROJECT_ROOT"
-    docker build -f Dockerfile.production -t "$IMAGE_NAME" .
+    # Build with current user's UID, GID, and name for proper permissions
+    docker build -f Dockerfile.production \
+        --build-arg USER_ID=$(id -u) \
+        --build-arg GROUP_ID=$(id -g) \
+        --build-arg USER_NAME=$(whoami) \
+        -t "$IMAGE_NAME" .
     echo -e "${GREEN}✓ Docker image built successfully${NC}"
     echo ""
 else
@@ -128,23 +138,83 @@ else
     echo ""
 fi
 
+# Create or use persistent Claude authentication volume
+CLAUDE_VOLUME="code-reviewer-claude-auth"
+
+# Check if volume exists, create if not
+if ! docker volume inspect "$CLAUDE_VOLUME" &> /dev/null; then
+    echo -e "${YELLOW}Creating persistent Claude authentication volume...${NC}"
+    docker volume create "$CLAUDE_VOLUME"
+fi
+
+# Check if Claude is authenticated in the volume
+echo -e "${YELLOW}Checking Claude authentication...${NC}"
+AUTH_CHECK=$(docker run --rm \
+    -v "$CLAUDE_VOLUME:/claude-auth" \
+    --entrypoint /bin/bash \
+    "$IMAGE_NAME" \
+    -c "test -f /claude-auth/settings.local.json || test -f /claude-auth/.credentials.json && echo 'authenticated' || echo 'not-authenticated'")
+
+echo "AUTH_CHECK result: '$AUTH_CHECK'"
+
+if [[ "$AUTH_CHECK" != "authenticated" ]]; then
+    echo -e "${YELLOW}Claude authentication required. Starting interactive authentication...${NC}"
+    echo ""
+    echo -e "${BLUE}Please complete the authentication process in your browser.${NC}"
+    echo -e "${BLUE}Press 'c' to copy the login URL if the browser doesn't open automatically.${NC}"
+    echo ""
+
+    # Run interactive authentication
+    docker run -it --rm \
+        -v "$CLAUDE_VOLUME:/claude-auth" \
+        -e INTERACTIVE_AUTH=true \
+        --entrypoint /bin/bash \
+        "$IMAGE_NAME" \
+        -c "
+            # Ensure claude-auth is writable
+            mkdir -p /claude-auth
+            chmod 755 /claude-auth
+
+            # Create symlink for Claude to use
+            rm -rf ~/.claude
+            ln -s /claude-auth ~/.claude
+
+            # Add Claude to PATH
+            export PATH=\"/root/.local/bin:\$PATH\"
+
+            # Run authentication
+            claude login
+
+            # Verify authentication
+            if [ -f /claude-auth/settings.local.json ] || [ -f /claude-auth/.credentials.json ]; then
+                echo ''
+                echo '✓ Authentication successful!'
+            else
+                echo '✗ Authentication failed. Please try again.'
+                exit 1
+            fi
+        "
+
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}Authentication failed. Exiting.${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓ Claude authentication complete${NC}"
+    echo ""
+fi
+
 # Run the review
 echo -e "${YELLOW}Starting review...${NC}"
 echo ""
 
-# Mount Claude Code session from host
-CLAUDE_CONFIG_DIR="${HOME}/.claude"
-if [[ ! -d "$CLAUDE_CONFIG_DIR" ]]; then
-    echo -e "${RED}Error: Claude Code not authenticated on host${NC}"
-    echo "Run: claude login"
-    exit 1
-fi
-
-echo -e "${GREEN}✓ Using authenticated Claude Code session from host${NC}"
+# Set MCP port
+MCP_PORT="${MCP_PORT:-4567}"
 
 docker run --rm \
+    -v "$CLAUDE_VOLUME:/claude-auth" \
     -e GITHUB_TOKEN="$GITHUB_TOKEN" \
-    -v "${CLAUDE_CONFIG_DIR}:/home/appuser/.claude:ro" \
+    -e MCP_PORT="$MCP_PORT" \
     "$IMAGE_NAME" \
     review "$REPO" "$PR_NUMBER" "${MIX_ARGS[@]}"
 

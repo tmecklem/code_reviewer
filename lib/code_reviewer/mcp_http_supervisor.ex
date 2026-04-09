@@ -16,7 +16,15 @@ defmodule CodeReviewer.MCPHttpSupervisor do
     port = Application.get_env(:code_reviewer, :mcp_port, 4567)
 
     children = [
-      {Plug.Cowboy, scheme: :http, plug: CodeReviewer.MCPHttpServer, options: [port: port]}
+      # Start the FeedbackStore first to create and manage the ETS table
+      CodeReviewer.FeedbackStore,
+      {Plug.Cowboy,
+       scheme: :http,
+       plug: CodeReviewer.MCPHttpServer,
+       options: [
+         port: port,
+         ip: {0, 0, 0, 0}  # Explicitly bind to all interfaces
+       ]}
     ]
 
     Logger.info("Starting MCP HTTP Server on port #{port}")

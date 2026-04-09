@@ -1,7 +1,7 @@
 import Config
 
 # Production environment configuration
-# MCP server is started on demand in production
+# MCP server is started automatically in production
 config :code_reviewer,
-  start_mcp_server: false,
+  start_mcp_server: true,
   mcp_port: 4567

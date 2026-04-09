@@ -3,6 +3,8 @@ defmodule CodeReviewer.OutputFormatter do
   Formats review results into GitHub-ready comments and summary notes.
   """
 
+  alias CodeReviewer.ResilientGitHubPoster
+
   @doc """
   Formats a review result into structured comments and summary.
 
@@ -120,4 +122,23 @@ defmodule CodeReviewer.OutputFormatter do
 
   defp pluralize(word, 1), do: word
   defp pluralize(word, _), do: "#{word}s"
+
+  @doc """
+  Posts review to GitHub using resilient posting strategy.
+
+  Attempts to post inline comments individually, with fallback to
+  PR-level comment for any that fail.
+  """
+  def post_review_to_github(repo, pr_number, commit_sha, review_result) do
+    with {:ok, formatted} <- format_review(review_result),
+         {:ok, result} <- ResilientGitHubPoster.post_review_resilient(
+           repo,
+           pr_number,
+           commit_sha,
+           formatted.comments,
+           formatted.summary
+         ) do
+      {:ok, result}
+    end
+  end
 end

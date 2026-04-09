@@ -10,6 +10,10 @@ defmodule CodeReviewer.Test.Mocks do
     @callback fetch_pr_info(String.t(), integer()) :: {:ok, map()} | {:error, String.t()}
     @callback fetch_pr_diff(String.t(), integer()) :: {:ok, String.t()} | {:error, String.t()}
     @callback fetch_pr_files(String.t(), integer()) :: {:ok, list(map())} | {:error, String.t()}
+    @callback create_pending_review(String.t(), integer(), String.t(), list(map()), String.t()) ::
+                {:ok, String.t()} | {:error, String.t()}
+    @callback submit_review(String.t(), integer(), String.t(), String.t()) ::
+                {:ok, String.t()} | {:error, String.t()}
   end
 
   # Define behavior for ClaudeCode provider
@@ -19,7 +23,16 @@ defmodule CodeReviewer.Test.Mocks do
                 {:ok, map()} | {:error, String.t()}
   end
 
+  # Define behavior for ACP Port operations
+  defmodule ACPPortBehaviour do
+    @callback open(tuple()) :: port()
+    @callback command(port(), binary()) :: true
+    @callback close(port()) :: true
+    @callback info(port()) :: {:ok, keyword()} | nil
+  end
+
   # Define mocks
   defmock(GitHubClientMock, for: GitHubClientBehaviour)
   defmock(ClaudeCodeProviderMock, for: ClaudeCodeProviderBehaviour)
+  defmock(ACPPortMock, for: ACPPortBehaviour)
 end

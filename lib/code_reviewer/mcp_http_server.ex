@@ -4,6 +4,7 @@ defmodule CodeReviewer.MCPHttpServer do
 
   Provides git_diff and grep_files tools via JSON-RPC 2.0 over HTTP.
   Supports chunking for large diff responses.
+  Includes feedback accumulator for deduplicating review comments.
   """
 
   use Plug.Router
@@ -44,7 +45,7 @@ defmodule CodeReviewer.MCPHttpServer do
             error_response(nil, -32700, "Parse error")
 
           params ->
-            case handle_jsonrpc(params) do
+            case handle_jsonrpc(params, conn) do
               {:ok, response} -> response
               {:error, response} -> response
             end
@@ -77,10 +78,12 @@ defmodule CodeReviewer.MCPHttpServer do
     # Store working directory in process dictionary for this test approach
     Process.put(:working_dir, working_dir)
 
+
     # For tests, we don't need to start an actual HTTP server
     # The Plug.Test helpers simulate HTTP requests
     {:ok, self()}
   end
+
 
   def call(conn, opts) do
     # Allow working_dir to be passed as an option or use process dictionary
@@ -92,11 +95,11 @@ defmodule CodeReviewer.MCPHttpServer do
 
   # JSON-RPC handlers
 
-  defp handle_jsonrpc(nil) do
+  defp handle_jsonrpc(nil, _conn) do
     {:error, error_response(nil, -32700, "Parse error")}
   end
 
-  defp handle_jsonrpc(request) when is_map(request) do
+  defp handle_jsonrpc(request, conn) when is_map(request) do
     id = Map.get(request, "id")
     method = Map.get(request, "method")
     params = Map.get(request, "params", %{})
@@ -109,7 +112,7 @@ defmodule CodeReviewer.MCPHttpServer do
         handle_tools_list(id, params)
 
       "tools/call" ->
-        handle_tools_call(id, params)
+        handle_tools_call(id, params, conn)
 
       nil ->
         {:error, error_response(id, -32600, "Invalid request")}
@@ -123,7 +126,7 @@ defmodule CodeReviewer.MCPHttpServer do
       {:error, error_response(Map.get(request, "id"), -32603, "Internal error")}
   end
 
-  defp handle_jsonrpc(_) do
+  defp handle_jsonrpc(_, _conn) do
     {:error, error_response(nil, -32700, "Parse error")}
   end
 
@@ -200,16 +203,72 @@ defmodule CodeReviewer.MCPHttpServer do
           },
           "required" => ["pattern"]
         }
+      },
+      %{
+        "name" => "add_feedback",
+        "description" => "Add review feedback with deduplication by file and line",
+        "inputSchema" => %{
+          "type" => "object",
+          "properties" => %{
+            "severity" => %{
+              "type" => "string",
+              "enum" => ["critical", "high", "medium", "low"],
+              "description" => "Severity level of the issue"
+            },
+            "file" => %{
+              "type" => "string",
+              "description" => "File path where the issue is located"
+            },
+            "line" => %{
+              "type" => "integer",
+              "description" => "Line number where the issue is located"
+            },
+            "issue" => %{
+              "type" => "string",
+              "description" => "Description of the issue"
+            },
+            "suggestion" => %{
+              "type" => "string",
+              "description" => "Suggested fix for the issue"
+            },
+            "quote" => %{
+              "type" => "string",
+              "description" => "Code snippet showing the issue (optional)"
+            }
+          },
+          "required" => ["severity", "file", "line", "issue", "suggestion"]
+        }
+      },
+      %{
+        "name" => "get_feedback",
+        "description" => "Get accumulated feedback (deduplicated)",
+        "inputSchema" => %{
+          "type" => "object",
+          "properties" => %{}
+        }
+      },
+      %{
+        "name" => "clear_feedback",
+        "description" => "Clear all accumulated feedback",
+        "inputSchema" => %{
+          "type" => "object",
+          "properties" => %{}
+        }
       }
     ]
 
     {:ok, success_response(id, %{"tools" => tools})}
   end
 
-  defp handle_tools_call(id, params) do
+  defp handle_tools_call(id, params, conn) do
     name = Map.get(params, "name")
     arguments = Map.get(params, "arguments", %{})
-    working_dir = Process.get(:working_dir, File.cwd!())
+
+    # Get working directory from header if provided, otherwise use process default
+    working_dir = case get_req_header(conn, "x-working-dir") do
+      [dir | _] -> dir
+      [] -> Process.get(:working_dir, File.cwd!())
+    end
 
     case name do
       "git_diff" ->
@@ -220,6 +279,18 @@ defmodule CodeReviewer.MCPHttpServer do
         result = call_grep_files(arguments, working_dir)
         {:ok, success_response(id, result)}
 
+      "add_feedback" ->
+        result = call_add_feedback(arguments)
+        {:ok, success_response(id, result)}
+
+      "get_feedback" ->
+        result = call_get_feedback()
+        {:ok, success_response(id, result)}
+
+      "clear_feedback" ->
+        result = call_clear_feedback()
+        {:ok, success_response(id, result)}
+
       _ ->
         {:error, error_response(id, -32602, "Unknown tool: #{name}")}
     end
@@ -227,14 +298,79 @@ defmodule CodeReviewer.MCPHttpServer do
 
   # Tool implementations
 
+  defp call_add_feedback(args) do
+    # Validate required fields
+    required_fields = ["severity", "file", "line", "issue", "suggestion"]
+
+    if Enum.all?(required_fields, fn field -> Map.has_key?(args, field) end) do
+      case CodeReviewer.FeedbackStore.add_feedback(args) do
+        {:ok, message} ->
+          %{
+            "content" => [
+              %{
+                "type" => "text",
+                "text" => message
+              }
+            ]
+          }
+
+        {:duplicate, message} ->
+          %{
+            "content" => [
+              %{
+                "type" => "text",
+                "text" => message
+              }
+            ]
+          }
+      end
+    else
+      %{
+        "content" => [
+          %{
+            "type" => "text",
+            "text" => "Error: Missing required fields",
+            "isError" => true
+          }
+        ]
+      }
+    end
+  end
+
+  defp call_get_feedback do
+    feedback = CodeReviewer.FeedbackStore.get_all_feedback()
+
+    %{
+      "content" => [
+        %{
+          "type" => "text",
+          "text" => Jason.encode!(feedback)
+        }
+      ]
+    }
+  end
+
+  defp call_clear_feedback do
+    CodeReviewer.FeedbackStore.clear_all_feedback()
+
+    %{
+      "content" => [
+        %{
+          "type" => "text",
+          "text" => "Feedback cleared successfully"
+        }
+      ]
+    }
+  end
+
   defp call_git_diff(args, working_dir) do
-    ref1 = Map.get(args, "ref1")
+    ref1 = Map.get(args, "ref1", "HEAD")
     ref2 = Map.get(args, "ref2")
     three_dot = Map.get(args, "three_dot", true)
     offset = Map.get(args, "offset", 0)
     limit = Map.get(args, "limit")
 
-    # Build git diff command
+    # Build git diff command - just try to run it
     diff_args =
       cond do
         ref2 && three_dot -> ["diff", "#{ref1}...#{ref2}"]

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "code-reviewer-mcp": {
+      "command": "http",
+      "args": ["http://localhost:4567/rpc"],
+      "alwaysAllow": true
+    }
+  },
+  "permissionMode": "bypass",
+  "dangerouslySkipPermissions": true
+}

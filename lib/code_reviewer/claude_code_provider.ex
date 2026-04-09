@@ -107,23 +107,31 @@ defmodule CodeReviewer.ClaudeCodeProvider do
     # Clone the repo
     case System.cmd("gh", ["repo", "clone", repo, temp_dir], stderr_to_stdout: true) do
       {_, 0} ->
-        # Fetch and checkout the PR branch
+        # Fetch ALL remote branches and set up tracking
         with {_, 0} <-
-               System.cmd("git", ["fetch", "origin", "#{head_branch}:#{head_branch}"],
+               System.cmd("git", ["fetch", "origin"],
                  cd: temp_dir,
                  stderr_to_stdout: true
                ),
-             {_, 0} <-
-               System.cmd("git", ["checkout", head_branch],
+             # Create local tracking branches for both base and head if they don't exist
+             # Use checkout -b which will succeed even if branch exists
+             _ <-
+               System.cmd("git", ["checkout", "-B", base_branch, "origin/#{base_branch}"],
+                 cd: temp_dir,
+                 stderr_to_stdout: true
+               ),
+             _ <-
+               System.cmd("git", ["checkout", "-B", head_branch, "origin/#{head_branch}"],
                  cd: temp_dir,
                  stderr_to_stdout: true
                ) do
           Logger.info("Checked out branch #{head_branch}, base is #{base_branch}")
+          Logger.info("Available local branches: #{base_branch}, #{head_branch}")
           {:ok, temp_dir}
         else
           {error, _} ->
             cleanup_temp_repo(temp_dir)
-            {:error, "Failed to fetch/checkout PR branch: #{error}"}
+            {:error, "Failed to set up branches: #{error}"}
         end
 
       {error, _} ->

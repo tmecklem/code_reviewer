@@ -87,18 +87,22 @@ defmodule Mix.Tasks.Review do
 
     rule_groups = get_rule_groups(opts)
 
-    case Reviewer.review_and_format(repo, pr_number, rule_groups) do
-      {:ok, formatted} ->
-        display_results(formatted)
+    try do
+      case Reviewer.review_and_format(repo, pr_number, rule_groups) do
+        {:ok, formatted} ->
+          display_results(formatted)
 
-        if Keyword.get(opts, :post, false) do
-          post_review(repo, pr_number, formatted)
-        else
-          Mix.shell().info("\n💡 Run with --post to publish these comments to GitHub")
-        end
+          if Keyword.get(opts, :post, false) do
+            post_review(repo, pr_number, formatted)
+          else
+            Mix.shell().info("\n💡 Run with --post to publish these comments to GitHub")
+          end
 
-      {:error, reason} ->
-        Mix.shell().error("❌ Review failed: #{reason}")
+        {:error, reason} ->
+          Mix.shell().error("❌ Review failed: #{reason}")
+      end
+    after
+      cleanup_after_review()
     end
   end
 
@@ -190,10 +194,12 @@ defmodule Mix.Tasks.Review do
         # Start the MCP HTTP supervisor if not already started
         case Supervisor.start_child(CodeReviewer.Supervisor, CodeReviewer.MCPHttpSupervisor) do
           {:ok, _pid} ->
+            Mix.shell().info("✓ MCP supervisor started successfully")
             # Wait for server to be ready
             wait_for_mcp_server(port)
 
           {:error, {:already_started, _pid}} ->
+            Mix.shell().info("✓ MCP supervisor already running")
             # Server supervisor is already running, just wait for it to be ready
             wait_for_mcp_server(port)
 
@@ -207,28 +213,36 @@ defmodule Mix.Tasks.Review do
   defp check_mcp_server_health(port) do
     url = ~c"http://localhost:#{port}/health"
 
-    :inets.start()
-
-    case :httpc.request(:get, {url, []}, [{:timeout, 2000}], []) do
+    case :httpc.request(:get, {url, []}, [{:timeout, 5000}, {:connect_timeout, 5000}], []) do
       {:ok, {{_version, 200, _reason}, _headers, _body}} ->
         :ok
 
-      error ->
-        {:error, error}
+      {:error, reason} = error ->
+        Logger.debug("Health check failed: #{inspect(reason)}")
+        error
+
+      other ->
+        Logger.debug("Unexpected health check response: #{inspect(other)}")
+        {:error, other}
     end
   rescue
-    _ ->
+    exception ->
+      Logger.debug("Health check exception: #{inspect(exception)}")
       {:error, :connection_failed}
   end
 
-  defp wait_for_mcp_server(port, attempts \\ 10) do
+  defp wait_for_mcp_server(port, attempts \\ 20) do
     if attempts == 0 do
       Mix.shell().error("❌ MCP server failed to start on port #{port}")
       Mix.shell().error("The application requires the MCP server to be running for code reviews.")
       System.halt(1)
     end
 
-    Process.sleep(500)
+    if attempts < 20 do
+      Mix.shell().info("Waiting for MCP server... (attempt #{21 - attempts}/20)")
+    end
+
+    Process.sleep(1000)
 
     case check_mcp_server_health(port) do
       :ok ->
@@ -243,7 +257,10 @@ defmodule Mix.Tasks.Review do
             System.halt(1)
         end
 
-      {:error, _} ->
+      {:error, error} ->
+        if attempts == 1 do
+          Mix.shell().error("Last health check error: #{inspect(error)}")
+        end
         wait_for_mcp_server(port, attempts - 1)
     end
   end
@@ -294,5 +311,32 @@ defmodule Mix.Tasks.Review do
   rescue
     error ->
       {:error, "RPC check failed: #{inspect(error)}"}
+  end
+
+  defp cleanup_after_review do
+    Mix.shell().info("\n🧹 Cleaning up after review...")
+
+    # Clear the feedback store
+    try do
+      CodeReviewer.FeedbackStore.clear_all_feedback()
+      Mix.shell().info("✓ Cleared feedback store")
+    rescue
+      _ -> :ok
+    end
+
+    # Stop the MCP HTTP server
+    case Supervisor.terminate_child(CodeReviewer.Supervisor, CodeReviewer.MCPHttpSupervisor) do
+      :ok ->
+        Supervisor.delete_child(CodeReviewer.Supervisor, CodeReviewer.MCPHttpSupervisor)
+        Mix.shell().info("✓ Stopped MCP HTTP server")
+
+      {:error, :not_found} ->
+        Mix.shell().info("✓ MCP server already stopped")
+
+      {:error, reason} ->
+        Mix.shell().info("⚠ Could not stop MCP server: #{inspect(reason)}")
+    end
+
+    Mix.shell().info("✓ Cleanup complete")
   end
 end
