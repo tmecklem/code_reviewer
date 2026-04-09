@@ -1,0 +1,14 @@
+#!/usr/bin/env elixir
+
+# MCP Server Standalone Script
+# This script starts the MCP server for code review
+
+# Get working directory from command line argument or use current directory
+working_dir = System.argv() |> List.first() || File.cwd!()
+
+# Add the project to the load path
+Code.append_path("_build/dev/lib/code_reviewer/ebin")
+Code.append_path("_build/dev/lib/jason/ebin")
+
+# Start the MCP server
+CodeReviewer.MCPServer.start(working_dir)

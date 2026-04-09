@@ -1,0 +1,287 @@
+# syntax = docker/dockerfile:1
+
+# Build stage
+FROM debian:bookworm-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV MIX_ENV=prod
+ENV MIX_HOME=/opt/mix
+ENV HEX_HOME=/opt/hex
+
+# Install build dependencies
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y \
+    locales \
+    build-essential \
+    curl \
+    ca-certificates \
+    git \
+    autoconf \
+    libssl-dev \
+    libncurses5-dev \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure UTF-8 locale
+RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && \
+    locale-gen
+
+# Install mise
+RUN curl https://mise.run | sh && \
+    echo 'eval "$(~/.local/bin/mise activate bash)"' >> /root/.bashrc
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Install Erlang and Elixir via mise
+WORKDIR /app
+COPY .tool-versions .
+RUN mise install && \
+    mise reshim
+
+# Install hex and rebar
+RUN mise exec -- mix local.hex --force && \
+    mise exec -- mix local.rebar --force
+
+# Copy dependency files
+COPY mix.exs mix.lock ./
+
+# Install dependencies
+RUN mise exec -- mix deps.get --only prod && \
+    mise exec -- mix deps.compile
+
+# Copy application code
+COPY lib ./lib
+
+# Compile application
+RUN mise exec -- mix compile
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV MIX_ENV=prod
+ENV LLM_PROVIDER=claude_code
+ENV ASDF_DIR=/root/.asdf
+
+# Install runtime dependencies
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y \
+    locales \
+    curl \
+    ca-certificates \
+    libssl3 \
+    libncurses6 \
+    git \
+    bash \
+    sudo \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js (required for ACP client via npx)
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
+    apt-get install --no-install-recommends -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install ACP client globally
+RUN npm install -g @zed-industries/claude-agent-acp
+
+# Install Claude Code CLI using the native installer
+RUN curl -fsSL https://storage.googleapis.com/claude-cli/install.sh | sh
+
+# Add to PATH
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Install gh CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+    apt-get update && \
+    apt-get install -y gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Configure UTF-8 locale
+RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && \
+    locale-gen
+
+# Create user matching the host user (will be overridden at build time)
+# Default to uid 1000 if not provided
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+ARG USER_NAME=appuser
+
+# Create group and user with matching UID/GID from host
+RUN groupadd -g ${GROUP_ID} ${USER_NAME} || true && \
+    useradd -m -s /bin/bash -u ${USER_ID} -g ${GROUP_ID} ${USER_NAME} && \
+    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USER_NAME} && \
+    chmod 0440 /etc/sudoers.d/${USER_NAME}
+
+# Set up environment for the user
+ENV HOME=/home/${USER_NAME}
+ENV USER_NAME=${USER_NAME}
+
+# Copy mise binary and installed runtimes from builder to user's home
+COPY --from=builder --chown=${USER_ID}:${GROUP_ID} /root/.local/bin/mise /home/${USER_NAME}/.local/bin/mise
+COPY --from=builder --chown=${USER_ID}:${GROUP_ID} /root/.local/share/mise /home/${USER_NAME}/.local/share/mise
+
+# Set up mise activation for user
+USER ${USER_NAME}
+RUN echo 'eval "$(~/.local/bin/mise activate bash)"' >> /home/${USER_NAME}/.bashrc
+
+# Add to PATH
+ENV PATH="/home/${USER_NAME}/.local/bin:${PATH}"
+
+# Switch back to root for copying application files
+USER root
+
+# Copy built application from builder
+WORKDIR /app
+COPY --from=builder /app/.tool-versions ./
+COPY --from=builder /app/_build/prod ./\_build/prod
+COPY --from=builder /app/deps ./deps
+COPY --from=builder /app/mix.exs /app/mix.lock ./
+COPY --from=builder /app/lib ./lib
+COPY --from=builder /opt/mix /opt/mix
+COPY --from=builder /opt/hex /opt/hex
+
+# Create Claude settings directory with MCP permissions
+RUN mkdir -p /app/.claude && \
+    cat > /app/.claude/settings.json <<'EOF'
+{
+  "defaultMode": "bypassPermissions",
+  "permissions": {
+    "allow": ["*"]
+  },
+  "dangerouslySkipPermissions": true
+}
+EOF
+
+# Create .mcp.json for MCP server configuration
+RUN cat > /app/.mcp.json <<'EOF'
+{
+  "mcpServers": {
+    "code-reviewer-mcp": {
+      "command": "http",
+      "args": ["http://localhost:4567/rpc"],
+      "alwaysAllow": true,
+      "dangerouslySkipPermissions": true
+    }
+  },
+  "permissionMode": "bypass",
+  "dangerouslySkipPermissions": true
+}
+EOF
+
+# Set ownership of /app to user
+RUN chown -R ${USER_ID}:${GROUP_ID} /app
+
+# Switch to user
+USER ${USER_NAME}
+
+# Install hex and rebar in runtime
+RUN mise exec -- mix local.hex --force && \
+    mise exec -- mix local.rebar --force
+
+# Switch back to root to create entrypoint script
+USER root
+
+# Create entrypoint script
+RUN cat > /entrypoint.sh <<'EOF'
+#!/bin/bash
+set -e
+
+# Validate required environment variables
+if [ -z "$GITHUB_TOKEN" ]; then
+  echo "ERROR: GITHUB_TOKEN environment variable is required"
+  exit 1
+fi
+
+# Set environment for ACP bypass permissions (contained in Docker)
+export CLAUDECODE_DANGEROUSLY_SKIP_PERMISSIONS=true
+export ACP_PERMISSION_MODE=bypassPermissions
+export MCP_PORT="${MCP_PORT:-4567}"
+# GitHub CLI expects GH_TOKEN, not GITHUB_TOKEN
+export GH_TOKEN="$GITHUB_TOKEN"
+
+# Get the current user's home directory, name, and group
+USER_NAME=$(whoami)
+USER_HOME=$(eval echo ~$USER_NAME)
+USER_GROUP=$(id -gn)
+
+# Check if persistent Claude volume is mounted
+if [ -d "/claude-auth" ]; then
+  echo "Using persistent Claude authentication from /claude-auth"
+  # Create symlink from user's .claude to the persistent volume
+  rm -rf $USER_HOME/.claude
+  ln -s /claude-auth $USER_HOME/.claude
+
+  # Ensure directories exist with proper permissions
+  mkdir -p /claude-auth/debug
+  chown -R $USER_NAME:$USER_GROUP /claude-auth 2>/dev/null || true
+else
+  # Fallback to copying from host if provided
+  mkdir -p $USER_HOME/.claude/debug
+  chown -R $USER_NAME:$USER_GROUP $USER_HOME/.claude
+
+  if [ "$COPY_CLAUDE_SETTINGS" = "true" ] && [ -d "/tmp/claude-host" ]; then
+    echo "Copying Claude settings from host..."
+    cp -r /tmp/claude-host/* $USER_HOME/.claude/ 2>/dev/null || true
+    chown -R $USER_NAME:$USER_GROUP $USER_HOME/.claude
+  else
+    echo "Using default Claude settings"
+    cp -r /app/.claude/* $USER_HOME/.claude/ 2>/dev/null || true
+    chown -R $USER_NAME:$USER_GROUP $USER_HOME/.claude
+  fi
+fi
+
+# Ensure CLAUDE_SETTINGS_DIR points to the .claude location
+export CLAUDE_SETTINGS_DIR=$USER_HOME/.claude
+
+# Check Claude authentication status (only if not in interactive auth mode)
+if [ "$INTERACTIVE_AUTH" != "true" ]; then
+  echo "Checking Claude authentication..."
+  if [ -f "$USER_HOME/.claude/settings.local.json" ] || [ -f "$USER_HOME/.claude/.credentials.json" ]; then
+    echo "✓ Claude authentication found"
+  else
+    echo "ERROR: Claude authentication required"
+    echo "The container needs to be authenticated first."
+    echo "This should have been handled by the docker-review script."
+    exit 1
+  fi
+fi
+
+# Set production environment
+export MIX_ENV=prod
+
+# The mix review command will auto-start the MCP server via ensure_mcp_server_running()
+# No need to start it separately here
+
+# Execute the review command with mise - pass environment variables through sudo
+cd /app
+# Pass all necessary environment variables to user
+sudo -E -u $USER_NAME bash -c "cd /app && \
+  HOME=$USER_HOME \
+  MIX_ENV=prod \
+  GH_TOKEN='$GH_TOKEN' \
+  GITHUB_TOKEN='$GITHUB_TOKEN' \
+  CLAUDECODE_DANGEROUSLY_SKIP_PERMISSIONS=true \
+  ACP_PERMISSION_MODE=bypassPermissions \
+  CLAUDE_SETTINGS_DIR=$USER_HOME/.claude \
+  $USER_HOME/.local/bin/mise exec -- mix $*"
+RESULT=$?
+
+exit $RESULT
+EOF
+
+RUN chmod +x /entrypoint.sh
+
+# Switch back to user for runtime
+USER ${USER_NAME}
+
+# Expose MCP server port
+EXPOSE 4567
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["review", "--help"]
